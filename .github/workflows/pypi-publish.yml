@@ -46,6 +46,3 @@ jobs:
   
         - name: Publish to PyPI
           uses: pypa/gh-action-pypi-publish@release/v1
-          with:
-            github_token: ${{ secrets.GITHUB_TOKEN }}
-            package_name: "instmodel"
