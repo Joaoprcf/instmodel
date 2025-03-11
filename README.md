@@ -1,0 +1,1 @@
+This package allow the easy creation of training models with keras backend and deploy them directly as instruction model
