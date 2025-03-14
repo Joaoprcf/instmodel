@@ -21,6 +21,75 @@ import json
 import numpy as np
 
 
+def test_simple_dense_model():
+    """
+    Tests a simple feed-forward model with three Dense layers:
+      - The first Dense uses ReLU activation.
+      - The second Dense uses ReLU activation.
+      - The third Dense uses Sigmoid activation.
+    Then validates that the exported instruction model matches the Keras outputs.
+    """
+
+    input_buffer = InputBuffer(4, name="simple_input")
+    hidden = Dense(8, activation="relu", name="hidden_relu_1")(input_buffer)
+    hidden = Dense(6, activation="relu", name="hidden_relu_2")(hidden)
+    output = Dense(1, activation="sigmoid", name="output_sigmoid")(hidden)
+
+    model_graph = ModelGraph(input_buffer, output)
+    model_graph.compile(optimizer="adam", loss="binary_crossentropy")
+
+    # Generate dummy data for demonstration.
+    x_data = np.random.random((10, 4))
+    y_data = np.random.randint(0, 2, size=(10, 1))  # random 0/1 labels
+
+    # Train for one epoch.
+    model_graph.fit(x_data, y_data, epochs=1, verbose=0)
+
+    # Export the trained model to an instruction model.
+    instruction_model = model_graph.create_instruction_model()
+
+    # Compare Keras predictions to the instruction-model predictions.
+    keras_pred = model_graph.predict(x_data, verbose=0)
+    instruction_model["validation_data"] = {
+        "inputs": x_data.tolist(),
+        "expected_outputs": keras_pred.tolist(),
+    }
+
+    # Validate to ensure both models produce the same output.
+    validate_instruction_model(instruction_model)
+    validate_keras_model(model_graph.get_keras(), instruction_model["validation_data"])
+
+    print(
+        "Simple Dense model validation successful: Instruction model matches Keras output."
+    )
+
+    del instruction_model["weights"]
+    del instruction_model["bias"]
+    del instruction_model["parameters"]
+    del instruction_model["maps"]
+    del instruction_model["validation_data"]
+
+    # If you want to test the exact instruction set, you can assert something like:
+    assert instruction_model["buffer_sizes"] == [4, 8, 6, 1]
+    assert instruction_model["instructions"] == [
+        {"type": "DOT", "input": 0, "output": 1, "weights": 0, "activation": "RELU"},
+        {"type": "DOT", "input": 1, "output": 2, "weights": 1, "activation": "RELU"},
+        {"type": "DOT", "input": 2, "output": 3, "weights": 2, "activation": "SIGMOID"},
+    ]
+
+    # This is the compact format to create a simple feed-forward model.
+    model_graph_copy = ff_model([4, 8, 6, 1], NO_BATCH_NORM, "rrs")
+
+    instruction_model_copy = model_graph_copy.create_instruction_model()
+
+    del instruction_model_copy["weights"]
+    del instruction_model_copy["bias"]
+    del instruction_model_copy["parameters"]
+    del instruction_model_copy["maps"]
+
+    assert instruction_model_copy == instruction_model
+
+
 def test_complex_attention_model():
     """
     Tests a complex attention-based model and validates both the instruction model and Keras model.
@@ -32,23 +101,22 @@ def test_complex_attention_model():
     d_out = Dense(1, activation="sigmoid", name="dense_output")(attn_out)
 
     model_graph = create_model_graph(i_target, d_out)
-    keras_model = model_graph.get_keras()
 
-    keras_model.compile(optimizer="adam", loss="mse")
-    x_dummy = np.random.random((50, 20))
-    y_dummy = np.random.random((50, 1))
-    keras_model.fit(x_dummy, y_dummy, epochs=2, verbose=0)
+    model_graph.compile(optimizer="adam", loss="mse")
+    x_data = np.random.random((50, 20))
+    y_data = np.random.random((50, 1))
+    model_graph.fit(x_data, y_data, epochs=2, verbose=0)
 
     result = create_instruction_model(i_target, d_out)
 
-    keras_pred = keras_model.predict(x_dummy, verbose=0)
+    keras_pred = model_graph.predict(x_data, verbose=0)
     result["validation_data"] = {
-        "inputs": x_dummy.tolist(),
+        "inputs": x_data.tolist(),
         "expected_outputs": keras_pred.tolist(),
     }
 
     validate_instruction_model(result)
-    validate_keras_model(keras_model, result["validation_data"])
+    validate_keras_model(model_graph.get_keras(), result["validation_data"])
 
     print("Validation successful: Instruction model output matches expected output.")
 
@@ -92,26 +160,24 @@ def test_nested_model():
 
     final_model = ModelGraph(main_input, dense_out)
 
-    model_keras = final_model.get_keras()
+    final_model.compile(optimizer="adam", loss="mse")
+    x_data = np.random.random((50, 3)) + 2
+    y_data = np.random.random((50, 1))
 
-    model_keras.compile(optimizer="adam", loss="mse")
-    x_dummy = np.random.random((50, 3)) + 2
-    y_dummy = np.random.random((50, 1))
-
-    model_keras.fit(x_dummy, y_dummy, epochs=1, verbose=0)
+    final_model.fit(x_data, y_data, epochs=1, verbose=0)
     result = final_model.create_instruction_model()
     with open("nested_model.json", "w") as f:
         json.dump(result, f, indent=2)
 
-    y_pred = model_keras.predict(x_dummy)
+    y_pred = final_model.predict(x_data)
 
     result["validation_data"] = {
-        "inputs": x_dummy.tolist(),
+        "inputs": x_data.tolist(),
         "expected_outputs": y_pred.tolist(),
     }
 
     validate_instruction_model(result)
-    validate_keras_model(model_keras, result["validation_data"])
+    validate_keras_model(final_model.get_keras(), result["validation_data"])
 
     del result["weights"]
     del result["bias"]
