@@ -4,6 +4,7 @@ from instmodel.model import (
     Dense,
     InputBuffer,
     ModelGraph,
+    Add,
     ff_model,
     create_instruction_model,
     create_model_graph,
@@ -15,10 +16,13 @@ from instmodel.model import (
 
 from instmodel.instruction_model import (
     validate_instruction_model,
+    instruction_model_inference,
+    generate_features,
 )
 
 import json
 import numpy as np
+import pandas as pd
 
 
 def test_simple_dense_model():
@@ -166,8 +170,6 @@ def test_nested_model():
 
     final_model.fit(x_data, y_data, epochs=1, verbose=0)
     result = final_model.create_instruction_model()
-    with open("nested_model.json", "w") as f:
-        json.dump(result, f, indent=2)
 
     y_pred = final_model.predict(x_data)
 
@@ -322,3 +324,38 @@ def test_slices():
             {"type": "COPY", "input": 2, "output": 3, "internal_index": 2},
         ],
     }
+
+
+def test_feature_computing():
+    """
+    Tests the feature computing functionality of the model.
+    """
+    input_buffers = [InputBuffer(1), InputBuffer(1)]
+
+    output = Add()(input_buffers)
+
+    model = ModelGraph(input_buffers, output)
+
+    inst_model = model.create_instruction_model(None, ["feature1", "feature2"])
+
+    with open("tests/files/instmodel.json", "r") as f:
+        file_content = json.load(f)
+
+    assert file_content == inst_model
+
+    result = instruction_model_inference(inst_model, [np.array([[1]]), np.array([[2]])])
+
+    assert result[0] == 1
+    assert result[1] == 2
+    assert result[2] == 3
+
+    # Create a DataFrame with the specified dataset.
+    simple_dataset = pd.DataFrame({"feature1": [1, 0.5], "feature2": [2, -5.0]})
+
+    simple_dataset = generate_features(
+        "tests/files/instmodel.json", simple_dataset, ["feature3"]
+    )
+
+    assert simple_dataset.columns.tolist() == ["feature1", "feature2", "feature3"]
+
+    assert simple_dataset["feature3"].tolist() == [3, -4.5]

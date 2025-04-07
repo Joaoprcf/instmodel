@@ -123,11 +123,35 @@ def instruction_model_inference(model, input_data):
                     f"Input data shape does not match the expected shape. Expected {buffer_sizes[i]} but got {buffers[i].shape[1]}"
                 )
     else:
-        buffers[0] = input_data.copy()
-        if buffers[0].shape[1] != buffer_sizes[0]:
+        # When input_data is a single numpy array, we need to partition it into the correct initial buffers.
+        total_features = input_data.shape[1]
+        accumulated = 0
+        accumulated_capacities = []
+        num_buffers = 0
+        valid = False
+
+        # Validate that the input feature size can be exactly partitioned into one or more buffers.
+        for size in buffer_sizes:
+            accumulated += size
+            accumulated_capacities.append(accumulated)
+            num_buffers += 1
+            if accumulated == total_features:
+                valid = True
+                break
+            elif accumulated > total_features:
+                break
+
+        if not valid:
             raise ValueError(
-                f"Input data shape does not match the expected shape. Expected {buffer_sizes[0]} but got {buffers[0].shape[1]}"
+                f"Invalid input feature size: expected one of the cumulative capacities {accumulated_capacities} but got {total_features}"
             )
+
+        # Partition the input_data into the first 'num_buffers' buffers.
+        start = 0
+        for i in range(num_buffers):
+            end = start + buffer_sizes[i]
+            buffers[i] = input_data[:, start:end].copy()
+            start = end
 
     # Process each instruction.
     for instruction in instructions:

@@ -1,0 +1,25 @@
+{
+  "features": [
+    "feature1",
+    "feature2"
+  ],
+  "buffer_sizes": [
+    1,
+    1,
+    1
+  ],
+  "instructions": [
+    {
+      "type": "ADD_ELEMENTWISE_BUFFERS",
+      "input": [
+        0,
+        1
+      ],
+      "output": 2
+    }
+  ],
+  "maps": [],
+  "weights": [],
+  "bias": [],
+  "parameters": []
+}
