@@ -3,7 +3,7 @@ import numpy as np
 from scipy.stats import kendalltau
 import pandas as pd
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Any, Dict, Optional, List
 import json
 
 import tensorflow as tf
@@ -49,9 +49,7 @@ def create_stair_structure(
         buffers.append(mid_buffer)
         current_buffer = mid_buffer
 
-    current_buffer = (
-        Concatenate()(buffers) if len(buffers) > 1 else current_buffer
-    )
+    current_buffer = Concatenate()(buffers) if len(buffers) > 1 else current_buffer
     model = ModelGraph(input_layer, current_buffer)
 
     return model, [layer.keras_layer for layer in layers]
@@ -98,16 +96,200 @@ def ff_model(sizes: list[int], use_batch_norm: int = 0, activations=None):
         else input_layer
     )
     for size in hidden_sizes:
-        current_buffer = Dense(size, activation=activations.pop(0))(
-            current_buffer
-        )
+        current_buffer = Dense(size, activation=activations.pop(0))(current_buffer)
 
-    dense = Dense(last_layer_size, activation=activations.pop(0))(
-        current_buffer
-    )
+    dense = Dense(last_layer_size, activation=activations.pop(0))(current_buffer)
     model = ModelGraph(input_layer, dense)
 
     return model
+
+
+import tensorflow as tf
+from tensorflow.keras import layers
+from typing import List, Optional
+
+
+class MultiOneHotDenseEncoder(tf.keras.layers.Layer):
+    """Learn a dense *embedding* for a sparse set of integer IDs.
+
+    During the forward pass it:
+        1. Maps raw integer IDs (possibly non-contiguous) → bucket indices.
+        2. One-hot encodes those indices (depth = N+1 where the last bucket is
+           unknown / out-of-vocabulary).
+        3. Applies a single bias-less `Dense` layer that projects the one-hot
+           vector to `output_dim`.
+
+    Parameters
+    ----------
+    train_ids : List[int]
+        All IDs encountered in the training data. They need **not** be
+        contiguous and may include negatives. They *must* be hashable.
+    output_dim : int
+        Dimensionality of the learned vector.
+    default_id : int, optional (default = -1)
+        The ID that represents the unknown / OOV token. If this ID is *not*
+        in `train_ids` it will automatically be treated as OOV.
+    key_dtype : tf.DType, optional (default = tf.int64)
+        Integer dtype for the lookup table.
+    """
+
+    def __init__(
+        self,
+        feature_indexes: List[int],
+        training_ids: List[List[int]],
+        output_dims: List[int],
+        name: Optional[str] = None,
+    ):
+        super().__init__(name=name)
+
+        self.feature_indexes = feature_indexes
+        self.training_ids = training_ids
+        self.output_dims = output_dims
+
+        self.singleIdEncoders = [
+            OneHotDenseEncoder(
+                train_ids=train_ids,
+                output_dim=output_dim,
+            )
+            for train_ids, output_dim in zip(training_ids, output_dims)
+        ]
+
+        self.added_buffer_size = sum(output_dims) - len(feature_indexes)
+
+    def call(self, inputs):
+        # Input validation
+        if not isinstance(inputs, list):
+            inputs = [inputs]
+        if len(inputs) != 1:
+            raise ValueError("Dense expects exactly one input in the list.")
+
+        input_tensor = inputs[0]
+
+        input_size = int(input_tensor.shape[1])
+
+        indexes_to_keep = [
+            i for i in range(input_size) if i not in self.feature_indexes
+        ]
+
+        indices_tensor = tf.constant(indexes_to_keep, dtype=tf.int32)
+
+        gather_layer_output = layers.Lambda(
+            lambda x: tf.gather(x, indices_tensor, axis=1),
+            name="gather_keep_other_features",
+        )(input_tensor)
+
+        # Apply the singleIdEncoders to the selected features
+        encoded_features = [
+            encoder(input_tensor[:, index])
+            for index, encoder in zip(self.feature_indexes, self.singleIdEncoders)
+        ]
+
+        concatenated = layers.Concatenate()([gather_layer_output] + encoded_features)
+
+        return concatenated
+
+
+class OneHotDenseEncoder(tf.keras.layers.Layer):
+    """Learn a dense *embedding* for a sparse set of integer IDs.
+
+    During the forward pass it:
+        1. Maps raw integer IDs (possibly non-contiguous) → bucket indices.
+        2. One-hot encodes those indices (depth = N+1 where the last bucket is
+           unknown / out-of-vocabulary).
+        3. Applies a single bias-less `Dense` layer that projects the one-hot
+           vector to `output_dim`.
+
+    Parameters
+    ----------
+    train_ids : List[int]
+        All IDs encountered in the training data. They need **not** be
+        contiguous and may include negatives. They *must* be hashable.
+    output_dim : int
+        Dimensionality of the learned vector.
+    default_id : int, optional (default = -1)
+        The ID that represents the unknown / OOV token. If this ID is *not*
+        in `train_ids` it will automatically be treated as OOV.
+    key_dtype : tf.DType, optional (default = tf.int64)
+        Integer dtype for the lookup table.
+    """
+
+    def __init__(
+        self,
+        train_ids: List[int],
+        output_dim: int,
+        default_id: int = -1,
+        key_dtype: tf.DType = tf.int64,
+        name: Optional[str] = None,
+    ):
+        super().__init__(name=name)
+        self.key_dtype = key_dtype
+        self.default_id = int(default_id)
+
+        # Deduplicate & preserve order
+        seen_ids = []
+        seen_set = set()
+        for _id in train_ids:
+            i = int(_id)
+            if i in seen_set:
+                raise ValueError(f"Duplicate ID found in train_ids: {_id}")
+            seen_ids.append(i)
+            seen_set.add(i)
+
+        if self.default_id in seen_set:
+            raise ValueError(f"default_id ({self.default_id}) must not be in train_ids")
+
+        # Python int count for static shapes & default_value
+        num_seen = len(seen_ids)  # N
+        self.depth = num_seen + 1  # one extra for unknown
+
+        # Build constant tensor of keys
+        keys = tf.constant(seen_ids, dtype=self.key_dtype)  # shape=(N,)
+
+        # Values 0..N-1
+        vals = tf.range(num_seen, dtype=self.key_dtype)  # shape=(N,)
+
+        initializer = tf.lookup.KeyValueTensorInitializer(
+            keys=keys,
+            values=vals,
+            key_dtype=self.key_dtype,
+            value_dtype=self.key_dtype,
+        )
+        # Anything not in keys → bucket N
+        self.table = tf.lookup.StaticHashTable(initializer, default_value=num_seen)
+
+        # Dense projection (no bias) → embedding vector
+        self.dense = layers.Dense(output_dim, use_bias=False, dtype=tf.float32)
+
+    def call(self, raw_ids):
+        """
+        raw_ids: tf.Tensor of floats (e.g. float32) containing integer IDs
+        (including the default_id) which will be rounded → cast → looked up.
+        """
+        # 1) Round & cast floats → integer keys
+        int_ids = tf.cast(tf.math.round(raw_ids), self.key_dtype)
+        int_ids = tf.reshape(int_ids, [-1])
+
+        # 2) Lookup bucket indices in [0..N]
+        bucket_idx = self.table.lookup(int_ids)
+
+        # 3) One-hot encode → (..., depth)
+        oh = tf.one_hot(bucket_idx, depth=self.depth, dtype=tf.float32)
+
+        # 4) Project → (..., output_dim)
+        return self.dense(oh)
+
+    @property
+    def os(self):
+        """
+        Shortcut for output size.
+        Assumes the tensor shape is (None, output_size) and returns that output_size.
+        """
+        return int(self.dense.shape[-1])
+
+    @property
+    def weight_matrix(self) -> tf.Tensor:
+        """Returns the (depth x output_dim) weight matrix of the Dense layer."""
+        return self.dense.kernel
 
 
 def generate_validation_data(
@@ -394,9 +576,7 @@ class Dense(ComputationOp):
 
     def compile_instructions(self, input_indices, weights_visited, model_structure):
         if len(input_indices) != 1:
-            raise ValueError(
-                "Dense.compile_instructions expects one input index."
-            )
+            raise ValueError("Dense.compile_instructions expects one input index.")
         wv = weights_visited["weights"]
         if id(self) not in wv:
             wv[id(self)] = len(model_structure["weights"])
@@ -434,7 +614,9 @@ class CopyMaskedComputation(ComputationOp):
         if not isinstance(inputs, list):
             inputs = [inputs]
         indices_tensor = tf.constant(self.indexes, dtype=tf.int32)
-        gather_layer = layers.Lambda(lambda x: tf.gather(x, indices=indices_tensor, axis=1))
+        gather_layer = layers.Lambda(
+            lambda x: tf.gather(x, indices=indices_tensor, axis=1)
+        )
         output_tensor = gather_layer(inputs[0].tensor)
         return DataBuffer(output_tensor, op=self, inputs=inputs)
 
@@ -487,6 +669,238 @@ class Concatenate(ComputationOp):
                 "internal_index": offset,
             }
             model_structure["instructions"].append(instr)
+        return output_index
+
+
+class MultiIdEmbeddings(ComputationOp):
+    """`ComputationOp` wrapper around `MultiOneHotDenseEncoder`.
+
+    * **Training**: behaves like the `tf.keras.layers.Layer` above, allowing the
+      graph to be trained end-to-end with back-prop + optimiser.
+    * **Compilation**: converts learned parameters to a constant lookup table
+      (`model["maps"]`) + a `MAP_TRANSFORM` instruction.
+
+    This keeps the *runtime* dependency-free while letting you train with the
+    full TF/Keras stack.
+    """
+
+    def __init__(
+        self,
+        feature_indexes: List[int],
+        training_ids: List[List[int]],
+        output_dims: List[int],
+        name: Optional[str] = None,
+    ):
+        super().__init__()
+        self.layer = MultiOneHotDenseEncoder(
+            feature_indexes=feature_indexes,
+            training_ids=training_ids,
+            output_dims=output_dims,
+        )
+
+        self.feature_indexes = feature_indexes
+        self.training_ids = training_ids
+        self.output_dims = output_dims
+
+        self.name = name
+
+    # ------------------------------------------------------------------
+    # Forward / eager execution
+    # ------------------------------------------------------------------
+    def __call__(self, inputs):
+        # Ensure list wrapping
+        if not isinstance(inputs, list):
+            inputs = [inputs]
+        if len(inputs) != 1:
+            raise ValueError("MultiIdEmbeddings expects exactly one input buffer.")
+
+        out_tensor = self.layer(inputs[0].tensor)
+        return DataBuffer(out_tensor, op=self, inputs=inputs)
+
+    # ------------------------------------------------------------------
+    # Compilation to instruction model
+    # ------------------------------------------------------------------
+    def compile_instructions(
+        self,
+        input_indices: List[int],
+        weights_visited: Dict[str, Dict[int, Any]],
+        model_structure: Dict[str, Any],
+    ) -> int:
+        if len(input_indices) != 1:
+            raise ValueError(
+                "MultiIdEmbeddings.compile_instructions expects one input index."
+            )
+
+        output_index = len(model_structure["buffer_sizes"])
+
+        output_size = (
+            model_structure["buffer_sizes"][input_indices[0]]
+            + self.layer.added_buffer_size
+        )
+
+        model_structure["buffer_sizes"].append(output_size)
+
+        indexes_to_keep = [
+            i
+            for i in range(model_structure["buffer_sizes"][input_indices[0]])
+            if i not in self.feature_indexes
+        ]
+
+        model_structure["instructions"].append(
+            {
+                "type": "COPY_MASKED",
+                "input": input_indices[0],
+                "output": output_index,
+                "indexes": indexes_to_keep,
+            }
+        )
+
+        internal_output_index = len(indexes_to_keep)
+
+        # Cache / build `maps` entry only once per layer instance
+        maps_cache = weights_visited["maps"]
+        # if id(self) not in maps_cache:
+        # Convert TF weight matrix to NumPy → Python list
+
+        for encoder_id, encoder in enumerate(self.layer.singleIdEncoders):
+            weight_matrix = encoder.weight_matrix.numpy()  # (depth, output_dim)
+            map_dict: Dict[int, List[float]] = {}
+
+            # Map each *seen* ID to its learned vector (bucket index = its row)
+            for bucket_idx, real_id in enumerate(self.training_ids[encoder_id]):
+                vector = weight_matrix[bucket_idx].astype(np.float32).tolist()
+                map_dict[int(real_id)] = vector
+
+            # Default / OOV bucket is the *last* row (index = N)
+            default_vector = weight_matrix[-1].astype(np.float32).tolist()
+            maps_cache[id(self)] = len(model_structure["maps"])
+            model_structure["maps"].append(map_dict)
+
+            map_index = maps_cache[id(self)]
+
+            # Emit MAP_TRANSFORM: unknown IDs map → default_vector (row N)
+            model_structure["instructions"].append(
+                {
+                    "type": "MAP_TRANSFORM",
+                    "input": input_indices[0],
+                    "output": output_index,
+                    "internal_input_index": self.feature_indexes[encoder_id],
+                    "internal_output_index": internal_output_index,
+                    "map": map_index,
+                    "size": self.output_dims[encoder_id],
+                    "default": default_vector,
+                }
+            )
+
+            internal_output_index += self.output_dims[encoder_id]
+
+        return output_index
+
+
+###############################################################################
+# ComputationOp wrapper that compiles to a single MAP_TRANSFORM instruction    #
+###############################################################################
+
+
+class SingleIdEmbeddings(ComputationOp):
+    """`ComputationOp` wrapper around `OneHotDenseEncoder`.
+
+    * **Training**: behaves like the `tf.keras.layers.Layer` above, allowing the
+      graph to be trained end-to-end with back-prop + optimiser.
+    * **Compilation**: converts learned parameters to a constant lookup table
+      (`model["maps"]`) + a `MAP_TRANSFORM` instruction.
+
+    This keeps the *runtime* dependency-free while letting you train with the
+    full TF/Keras stack.
+    """
+
+    def __init__(
+        self,
+        train_ids: List[int],
+        output_dim: int,
+        internal_input_index: int = 0,
+        name: Optional[str] = None,
+    ):
+        super().__init__()
+        default_id = -1
+        self.layer = OneHotDenseEncoder(
+            train_ids=train_ids, output_dim=output_dim, default_id=default_id
+        )
+        self.output_dim = int(output_dim)
+        self.default_id = int(default_id)
+        self.train_ids = list(dict.fromkeys(train_ids))  # deduplicated, ordered
+        self.internal_input_index = internal_input_index
+        self.name = name
+
+    # ------------------------------------------------------------------
+    # Forward / eager execution
+    # ------------------------------------------------------------------
+    def __call__(self, inputs):
+        # Ensure list wrapping
+        if not isinstance(inputs, list):
+            inputs = [inputs]
+        if len(inputs) != 1:
+            raise ValueError("SingleIdEmbeddings expects exactly one input buffer.")
+
+        out_tensor = self.layer(inputs[0].tensor)
+        return DataBuffer(out_tensor, op=self, inputs=inputs)
+
+    # ------------------------------------------------------------------
+    # Compilation to instruction model
+    # ------------------------------------------------------------------
+    def compile_instructions(
+        self,
+        input_indices: List[int],
+        weights_visited: Dict[str, Dict[int, Any]],
+        model_structure: Dict[str, Any],
+    ) -> int:
+        if len(input_indices) != 1:
+            raise ValueError(
+                "SingleIdEmbeddings.compile_instructions expects one input index."
+            )
+
+        # Cache / build `maps` entry only once per layer instance
+        maps_cache = weights_visited["maps"]
+        # if id(self) not in maps_cache:
+        # Convert TF weight matrix to NumPy → Python list
+        weight_matrix = self.layer.weight_matrix.numpy()  # (depth, output_dim)
+        map_dict: Dict[int, List[float]] = {}
+
+        # Map each *seen* ID to its learned vector (bucket index = its row)
+        for bucket_idx, real_id in enumerate(self.train_ids):
+            vector = weight_matrix[bucket_idx].astype(np.float32).tolist()
+            map_dict[int(real_id)] = vector
+
+        # Default / OOV bucket is the *last* row (index = N)
+        default_vector = weight_matrix[-1].astype(np.float32).tolist()
+        maps_cache[id(self)] = len(model_structure["maps"])
+        model_structure["maps"].append(map_dict)
+
+        # else:
+        #     default_vector = model_structure["maps"][maps_cache[id(self)]][
+        #         0
+        #     ]  # dummy fetch; we overwrite below
+        #     print("BIG PROBLEM??")
+
+        output_index = len(model_structure["buffer_sizes"])
+        model_structure["buffer_sizes"].append(self.output_dim)
+
+        map_index = maps_cache[id(self)]
+
+        # Emit MAP_TRANSFORM: unknown IDs map → default_vector (row N)
+        model_structure["instructions"].append(
+            {
+                "type": "MAP_TRANSFORM",
+                "input": input_indices[0],
+                "output": output_index,
+                "internal_input_index": self.internal_input_index,
+                "internal_output_index": 0,
+                "map": map_index,
+                "size": self.output_dim,
+                "default": default_vector,
+            }
+        )
+
         return output_index
 
 
@@ -602,7 +1016,9 @@ class Attention(ComputationOp):
         if self.keras_layer is None:
             self.a = target.os
             self.b = key.os
-            self.keras_layer = layers.Dense(self.a, name=self.name, activation="softmax")
+            self.keras_layer = layers.Dense(
+                self.a, name=self.name, activation="softmax"
+            )
 
         softmaxed = self.keras_layer(key.tensor)
         result_tensor = target.tensor * softmaxed
@@ -794,7 +1210,7 @@ class ModelGraph(ComputationOp):
         traverse(self.output_buffer)
         return visited[id(self.output_buffer)]
 
-    def create_instruction_model(self, weights_visited=None, features=None):
+    def create_instruction_model(self, features=None, weights_visited=None):
         model_structure = {
             "features": features or [],
             "buffer_sizes": [],

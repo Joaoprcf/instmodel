@@ -4,6 +4,8 @@ from instmodel.model import (
     Dense,
     InputBuffer,
     ModelGraph,
+    SingleIdEmbeddings,
+    MultiIdEmbeddings,
     Add,
     ff_model,
     create_instruction_model,
@@ -34,7 +36,7 @@ def test_simple_dense_model():
     Then validates that the exported instruction model matches the Keras outputs.
     """
 
-    input_buffer = InputBuffer(4, name="simple_input")
+    input_buffer = InputBuffer(4)
     hidden = Dense(8, activation="relu", name="hidden_relu_1")(input_buffer)
     hidden = Dense(6, activation="relu", name="hidden_relu_2")(hidden)
     output = Dense(1, activation="sigmoid", name="output_sigmoid")(hidden)
@@ -98,7 +100,7 @@ def test_complex_attention_model():
     """
     Tests a complex attention-based model and validates both the instruction model and Keras model.
     """
-    i_target = InputBuffer(20, name="target")
+    i_target = InputBuffer(20)
     i_key = Dense(10, name="key_dense")(i_target)
     attn = Attention(name="attention")
     attn_out = attn([i_target, i_key])
@@ -336,7 +338,7 @@ def test_feature_computing():
 
     model = ModelGraph(input_buffers, output)
 
-    inst_model = model.create_instruction_model(None, ["feature1", "feature2"])
+    inst_model = model.create_instruction_model(["feature1", "feature2"])
 
     with open("tests/files/instmodel.json", "r") as f:
         file_content = json.load(f)
@@ -359,3 +361,178 @@ def test_feature_computing():
     assert simple_dataset.columns.tolist() == ["feature1", "feature2", "feature3"]
 
     assert simple_dataset["feature3"].tolist() == [3, -4.5]
+
+
+def test_embeddings(capsys):
+    """
+    Tests the embedding functionality of the model.
+    """
+
+    # Generate dummy data
+    x_data = np.random.random((50, 3))
+    # Ensure the second column contains only integers 1 or 2
+    x_data[:, 1] = np.random.randint(1, 4, size=(50,))
+    # Calculate y_data based on x_data conditions
+    conditions = [x_data[:, 1] == 1, x_data[:, 1] == 2]
+    choices = [
+        x_data[:, 0] + x_data[:, 2],  # Choice for condition 1
+        x_data[:, 0] - x_data[:, 2] * 0.5,  # Choice for condition 2
+    ]
+    default_choice = -x_data[:, 0] + x_data[:, 2] * 1.5  # Default choice
+
+    y_data = np.select(conditions, choices, default=default_choice).reshape(-1, 1)
+
+    features = ["non-id1", "id1", "non-id2"]
+    input_buffer = InputBuffer(3)
+    non_id_features = input_buffer[0, 2]
+    id_features = input_buffer[(1,)]
+
+    converted_to_embedding = SingleIdEmbeddings([1, 2], 3)(id_features)
+
+    concatenated = Concatenate()([non_id_features, converted_to_embedding])
+
+    dense_mid = Dense(8, activation="relu")(concatenated)
+
+    dense_out = Dense(1)(dense_mid)
+
+    model = ModelGraph(input_buffer, dense_out)
+
+    model.compile(optimizer="adam", loss="mse")
+
+    model.fit(x_data, y_data, epochs=20, verbose=0)
+
+    # Predict after training
+    pred_after = model.predict(x_data, verbose=0)
+
+    instmodel = model.create_instruction_model(features)
+
+    *_, inst_output_y = instruction_model_inference(instmodel, x_data)
+
+    # Check if the instruction model output is close to the Keras model output
+    assert np.allclose(inst_output_y, pred_after, atol=1e-6), (
+        "Instruction model output does not match Keras output after training."
+    )
+
+    instmodel["validation_data"] = {
+        "inputs": x_data.tolist(),
+        "expected_outputs": pred_after.tolist(),
+    }
+
+    validate_instruction_model(instmodel)
+
+    assert len(instmodel["weights"]) == 2
+    del instmodel["weights"]
+    assert len(instmodel["bias"]) == 2
+    del instmodel["bias"]
+    assert len(instmodel["maps"]) == 1
+    assert instmodel["maps"][0].keys() == {1, 2}
+    del instmodel["maps"]
+    del instmodel["parameters"]
+    del instmodel["validation_data"]
+    assert len(instmodel["instructions"]) == 7
+    assert len(instmodel["instructions"][2]["default"]) == 3
+    del instmodel["instructions"][2]["default"]
+
+    assert instmodel == {
+        "features": features,
+        "buffer_sizes": [
+            len(features),
+            2,
+            1,
+            converted_to_embedding.os,
+            len(features) + converted_to_embedding.os - 1,
+            8,
+            1,
+        ],
+        "instructions": [
+            {"type": "COPY_MASKED", "input": 0, "output": 1, "indexes": [0, 2]},
+            {"type": "COPY_MASKED", "input": 0, "output": 2, "indexes": [1]},
+            {
+                "type": "MAP_TRANSFORM",
+                "input": 2,
+                "output": 3,
+                "internal_input_index": 0,
+                "internal_output_index": 0,
+                "map": 0,
+                "size": 3,
+            },
+            {"type": "COPY", "input": 1, "output": 4, "internal_index": 0},
+            {"type": "COPY", "input": 3, "output": 4, "internal_index": 2},
+            {
+                "type": "DOT",
+                "input": 4,
+                "output": 5,
+                "weights": 0,
+                "activation": "RELU",
+            },
+            {"type": "DOT", "input": 5, "output": 6, "weights": 1},
+        ],
+    }
+
+    encoded_input = MultiIdEmbeddings([1], [[1, 2]], [4])(input_buffer)
+
+    dense_mid = Dense(8, activation="relu")(encoded_input)
+
+    dense_out = Dense(1)(dense_mid)
+
+    encoded_model = ModelGraph(input_buffer, dense_out)
+
+    encoded_model.compile(optimizer="adam", loss="mse")
+
+    encoded_model.fit(x_data, y_data, epochs=20, verbose=0)
+
+    # Predict after training
+    pred_after = encoded_model.predict(x_data, verbose=0)
+
+    complex_instmodel = encoded_model.create_instruction_model(features)
+
+    *_, inst_output_y = instruction_model_inference(complex_instmodel, x_data)
+
+    assert np.allclose(inst_output_y, pred_after, atol=1e-6), (
+        "Instruction model output does not match Keras output after training."
+    )
+
+    complex_instmodel["validation_data"] = {
+        "inputs": x_data.tolist(),
+        "expected_outputs": pred_after.tolist(),
+    }
+
+    validate_instruction_model(complex_instmodel)
+
+    assert len(complex_instmodel["weights"]) == 2
+    del complex_instmodel["weights"]
+    assert len(complex_instmodel["bias"]) == 2
+    del complex_instmodel["bias"]
+    assert len(complex_instmodel["maps"]) == 1
+    assert complex_instmodel["maps"][0].keys() == {1, 2}
+    del complex_instmodel["maps"]
+    del complex_instmodel["parameters"]
+    del complex_instmodel["validation_data"]
+    assert len(complex_instmodel["instructions"]) == 4
+    assert len(complex_instmodel["instructions"][1]["default"]) == 4
+    del complex_instmodel["instructions"][1]["default"]
+
+    assert complex_instmodel == {
+        "features": features,
+        "buffer_sizes": [len(features), 6, 8, 1],
+        "instructions": [
+            {"type": "COPY_MASKED", "input": 0, "output": 1, "indexes": [0, 2]},
+            {
+                "type": "MAP_TRANSFORM",
+                "input": 0,
+                "output": 1,
+                "internal_input_index": 1,
+                "internal_output_index": 2,
+                "map": 0,
+                "size": 4,
+            },
+            {
+                "type": "DOT",
+                "input": 1,
+                "output": 2,
+                "weights": 0,
+                "activation": "RELU",
+            },
+            {"type": "DOT", "input": 2, "output": 3, "weights": 1},
+        ],
+    }

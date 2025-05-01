@@ -221,6 +221,13 @@ def instruction_model_inference(model, input_data):
             default = instruction["default"]
             size = instruction["size"]
             map_data = {int(k): v for k, v in model["maps"][map_index].items()}
+
+            if buffers[output_index] is None:
+                buffers[output_index] = np.zeros(
+                    (input_data_buffer.shape[0], buffer_sizes[output_index]),
+                    dtype=np.float32,
+                )
+
             buffers[output_index][
                 :, internal_output_index : internal_output_index + size
             ] = np.array(
