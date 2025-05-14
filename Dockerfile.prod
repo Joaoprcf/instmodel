@@ -1,0 +1,14 @@
+# Base image: Use an official Python image with TensorFlow pre-installed
+FROM tensorflow/tensorflow:2.17.0
+
+# Set the working directory inside the container
+WORKDIR /app
+
+# Ensure pip is up to date
+RUN apt-get install build-essential -y
+RUN pip install --upgrade pip && \
+    pip install pandas scipy scikit-learn
+RUN pip install instmodel --no-deps
+
+# Default command to run when the container starts (can be changed)
+CMD ["bash"]

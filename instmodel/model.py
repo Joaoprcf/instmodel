@@ -554,14 +554,33 @@ class Dense(ComputationOp):
     """
     A dense operation that expects its input as a one-element list.
     Shared weights are stored so that repeated calls reuse the same weight index.
+
+    Parameters
+    ----------
+    output_size : int
+        Number of units in the dense layer.
+    activation : str or None, default None
+        Activation applied after the matrix multiply.
+    use_bias : bool, default True
+        Whether to include a bias term.  When False, the compiler stores the
+        string `"all 0s"` in the bias slot so downstream code can treat it as
+        a zero-vector of the correct shape.
+    name : str or None, default None
+        Name forwarded to the underlying Keras layer.
     """
 
-    def __init__(self, output_size, activation=None, name=None):
+    def __init__(self, output_size, activation=None, use_bias=True, name=None):
         super().__init__()
         self.input_size = None
         self.output_size = output_size
         self.activation = activation
-        self.keras_layer = layers.Dense(output_size, activation=activation, name=name)
+        self.use_bias = use_bias
+        self.keras_layer = layers.Dense(
+            output_size,
+            activation=activation,
+            use_bias=use_bias,
+            name=name,
+        )
 
     def __call__(self, inputs):
         if not isinstance(inputs, list):
@@ -577,17 +596,26 @@ class Dense(ComputationOp):
     def compile_instructions(self, input_indices, weights_visited, model_structure):
         if len(input_indices) != 1:
             raise ValueError("Dense.compile_instructions expects one input index.")
-        wv = weights_visited["weights"]
-        if id(self) not in wv:
-            wv[id(self)] = len(model_structure["weights"])
-            weights, bias = self.keras_layer.get_weights()
-            model_structure["weights"].append(
-                weights.T.tolist()
-            )  # stored as (output, input)
-            model_structure["bias"].append(bias.tolist())
 
+        wv = weights_visited["weights"]
+        if id(self) not in wv:  # first time we see this op
+            wv[id(self)] = len(model_structure["weights"])
+
+            keras_weights = self.keras_layer.get_weights()
+            kernel = keras_weights[0]  # (in, out)
+            model_structure["weights"].append(kernel.T.tolist())
+
+            if self.use_bias:
+                bias = keras_weights[1]
+            else:
+                # real zero-vector the same length as output_size
+                bias = [0.0] * self.output_size
+            model_structure["bias"].append(bias)
+
+        # allocate output buffer
         output_index = len(model_structure["buffer_sizes"])
         model_structure["buffer_sizes"].append(self.output_size)
+
         instr = {
             "type": "DOT",
             "input": input_indices[0],
@@ -596,6 +624,7 @@ class Dense(ComputationOp):
         }
         if self.activation is not None:
             instr["activation"] = self.activation.upper()
+
         model_structure["instructions"].append(instr)
         return output_index
 
