@@ -7,6 +7,8 @@ from instmodel.model import (
     SingleIdEmbeddings,
     MultiIdEmbeddings,
     Add,
+    ScaleVectorized,
+    ShiftVectorized,
     ff_model,
     create_instruction_model,
     create_model_graph,
@@ -25,6 +27,10 @@ from instmodel.instruction_model import (
 import json
 import numpy as np
 import pandas as pd
+import tensorflow as tf
+
+# Disable TF32 to ensure full float32 precision on GPU (matches CPU/NumPy precision)
+tf.config.experimental.enable_tensor_float_32_execution(False)
 
 
 def test_simple_dense_model():
@@ -534,5 +540,89 @@ def test_embeddings(capsys):
                 "activation": "RELU",
             },
             {"type": "DOT", "input": 2, "output": 3, "weights": 1},
+        ],
+    }
+
+
+def test_scale_and_shift_vectorized():
+    """
+    Tests ScaleVectorized and ShiftVectorized operations.
+    """
+    input_buffer = InputBuffer(3)
+
+    # Apply scaling by [2, 0.5, 3] then shift by [1, -1, 0]
+    scaled = ScaleVectorized([2.0, 0.5, 3.0])(input_buffer)
+    shifted = ShiftVectorized([1.0, -1.0, 0.0])(scaled)
+
+    model = ModelGraph(input_buffer, shifted)
+
+    result = model.create_instruction_model()
+
+    # Check the instruction structure
+    del result["weights"]
+    del result["bias"]
+    del result["maps"]
+
+    # Parameters should contain the scale and shift vectors
+    assert len(result["parameters"]) == 2
+    assert result["parameters"][0] == [2.0, 0.5, 3.0]
+    assert result["parameters"][1] == [1.0, -1.0, 0.0]
+
+    del result["parameters"]
+
+    # Both operations are in-place on buffer 0
+    assert result == {
+        "features": [],
+        "buffer_sizes": [3],
+        "instructions": [
+            {"type": "MUL_ELEMENTWISE", "input": 0, "parameters": 0},
+            {"type": "ADD_ELEMENTWISE", "input": 0, "parameters": 1},
+        ],
+    }
+
+    # Test numerical correctness
+    x_data = np.array([[1.0, 2.0, 3.0], [0.0, -4.0, 2.0]])
+    keras_pred = model.predict(x_data, verbose=0)
+
+    # Expected: (x * scale) + shift
+    expected = x_data * np.array([2.0, 0.5, 3.0]) + np.array([1.0, -1.0, 0.0])
+    assert np.allclose(keras_pred, expected, atol=1e-6)
+
+    # Validate instruction model matches Keras
+    inst_model = model.create_instruction_model()
+    inst_model["validation_data"] = {
+        "inputs": x_data.tolist(),
+        "expected_outputs": keras_pred.tolist(),
+    }
+    validate_instruction_model(inst_model)
+
+
+def test_scale_and_shift_not_inplace():
+    """
+    Tests ScaleVectorized and ShiftVectorized with in_place=False.
+    """
+    input_buffer = InputBuffer(2)
+
+    scaled = ScaleVectorized([2.0, 3.0], in_place=False)(input_buffer)
+    shifted = ShiftVectorized([10.0, 20.0], in_place=False)(scaled)
+
+    model = ModelGraph(input_buffer, shifted)
+
+    result = model.create_instruction_model()
+
+    del result["weights"]
+    del result["bias"]
+    del result["maps"]
+    del result["parameters"]
+
+    # Not in-place means new buffers are allocated
+    assert result == {
+        "features": [],
+        "buffer_sizes": [2, 2, 2],
+        "instructions": [
+            {"type": "COPY", "input": 0, "output": 1, "internal_index": 0},
+            {"type": "MUL_ELEMENTWISE", "input": 1, "parameters": 0},
+            {"type": "COPY", "input": 1, "output": 2, "internal_index": 0},
+            {"type": "ADD_ELEMENTWISE", "input": 2, "parameters": 1},
         ],
     }

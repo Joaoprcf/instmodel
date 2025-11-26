@@ -241,21 +241,13 @@ class OneHotDenseEncoder(tf.keras.layers.Layer):
         # Python int count for static shapes & default_value
         num_seen = len(seen_ids)  # N
         self.depth = num_seen + 1  # one extra for unknown
+        self.oov_bucket = num_seen  # OOV maps to last bucket
 
-        # Build constant tensor of keys
-        keys = tf.constant(seen_ids, dtype=self.key_dtype)  # shape=(N,)
-
-        # Values 0..N-1
-        vals = tf.range(num_seen, dtype=self.key_dtype)  # shape=(N,)
-
-        initializer = tf.lookup.KeyValueTensorInitializer(
-            keys=keys,
-            values=vals,
-            key_dtype=self.key_dtype,
-            value_dtype=self.key_dtype,
-        )
-        # Anything not in keys → bucket N
-        self.table = tf.lookup.StaticHashTable(initializer, default_value=num_seen)
+        # Build lookup tensor: maps ID -> bucket index
+        # We create a tensor where index i contains the bucket for ID i
+        # For IDs not in train_ids, we use oov_bucket
+        self._seen_ids = seen_ids
+        self._id_to_bucket = {int(id_): bucket for bucket, id_ in enumerate(seen_ids)}
 
         # Dense projection (no bias) → embedding vector
         self.dense = layers.Dense(output_dim, use_bias=False, dtype=tf.float32)
@@ -269,8 +261,15 @@ class OneHotDenseEncoder(tf.keras.layers.Layer):
         int_ids = tf.cast(tf.math.round(raw_ids), self.key_dtype)
         int_ids = tf.reshape(int_ids, [-1])
 
-        # 2) Lookup bucket indices in [0..N]
-        bucket_idx = self.table.lookup(int_ids)
+        # 2) Map IDs to bucket indices using vectorized lookup
+        # Use tf.where with conditions for each known ID
+        bucket_idx = tf.fill(tf.shape(int_ids), tf.constant(self.oov_bucket, dtype=self.key_dtype))
+        for id_, bucket in self._id_to_bucket.items():
+            bucket_idx = tf.where(
+                tf.equal(int_ids, tf.constant(id_, dtype=self.key_dtype)),
+                tf.constant(bucket, dtype=self.key_dtype),
+                bucket_idx
+            )
 
         # 3) One-hot encode → (..., depth)
         oh = tf.one_hot(bucket_idx, depth=self.depth, dtype=tf.float32)
@@ -1021,6 +1020,122 @@ class NormalizationComputation(ComputationOp):
         model_structure["instructions"].append(instr_mul)
         model_structure["instructions"].append(instr_add)
 
+        return target_index
+
+
+class ScaleVectorized(ComputationOp):
+    """
+    Multiplies a buffer elementwise by a fixed vector.
+    Compiles to a MUL_ELEMENTWISE instruction.
+    """
+
+    def __init__(self, scaling_vector, in_place=True, name=None):
+        super().__init__()
+        self.scaling_vector = np.asarray(scaling_vector, dtype=np.float32)
+        self.in_place = in_place
+        self.name = name
+        self._scaling_tensor = tf.constant(self.scaling_vector, dtype=tf.float32)
+        self.keras_layer = layers.Lambda(
+            lambda x: x * self._scaling_tensor, name=name
+        )
+
+    def __call__(self, inputs):
+        if not isinstance(inputs, list):
+            inputs = [inputs]
+        if len(inputs) != 1:
+            raise ValueError("ScaleVectorized expects exactly one input.")
+        output_tensor = self.keras_layer(inputs[0].tensor)
+        return DataBuffer(output_tensor, op=self, inputs=inputs)
+
+    def compile_instructions(self, input_indices, weights_visited, model_structure):
+        if len(input_indices) != 1:
+            raise ValueError("ScaleVectorized expects exactly one input.")
+
+        pw = weights_visited["parameters"]
+
+        if self.in_place:
+            target_index = input_indices[0]
+        else:
+            target_index = len(model_structure["buffer_sizes"])
+            model_structure["buffer_sizes"].append(
+                model_structure["buffer_sizes"][input_indices[0]]
+            )
+            copy_instr = {
+                "type": "COPY",
+                "input": input_indices[0],
+                "output": target_index,
+                "internal_index": 0,
+            }
+            model_structure["instructions"].append(copy_instr)
+
+        if id(self) not in pw:
+            pw[id(self)] = len(model_structure["parameters"])
+            model_structure["parameters"].append(self.scaling_vector.tolist())
+
+        instr = {
+            "type": "MUL_ELEMENTWISE",
+            "input": target_index,
+            "parameters": pw[id(self)],
+        }
+        model_structure["instructions"].append(instr)
+        return target_index
+
+
+class ShiftVectorized(ComputationOp):
+    """
+    Adds a fixed vector elementwise to a buffer.
+    Compiles to an ADD_ELEMENTWISE instruction.
+    """
+
+    def __init__(self, shift_vector, in_place=True, name=None):
+        super().__init__()
+        self.shift_vector = np.asarray(shift_vector, dtype=np.float32)
+        self.in_place = in_place
+        self.name = name
+        self._shift_tensor = tf.constant(self.shift_vector, dtype=tf.float32)
+        self.keras_layer = layers.Lambda(
+            lambda x: x + self._shift_tensor, name=name
+        )
+
+    def __call__(self, inputs):
+        if not isinstance(inputs, list):
+            inputs = [inputs]
+        if len(inputs) != 1:
+            raise ValueError("ShiftVectorized expects exactly one input.")
+        output_tensor = self.keras_layer(inputs[0].tensor)
+        return DataBuffer(output_tensor, op=self, inputs=inputs)
+
+    def compile_instructions(self, input_indices, weights_visited, model_structure):
+        if len(input_indices) != 1:
+            raise ValueError("ShiftVectorized expects exactly one input.")
+
+        pw = weights_visited["parameters"]
+
+        if self.in_place:
+            target_index = input_indices[0]
+        else:
+            target_index = len(model_structure["buffer_sizes"])
+            model_structure["buffer_sizes"].append(
+                model_structure["buffer_sizes"][input_indices[0]]
+            )
+            copy_instr = {
+                "type": "COPY",
+                "input": input_indices[0],
+                "output": target_index,
+                "internal_index": 0,
+            }
+            model_structure["instructions"].append(copy_instr)
+
+        if id(self) not in pw:
+            pw[id(self)] = len(model_structure["parameters"])
+            model_structure["parameters"].append(self.shift_vector.tolist())
+
+        instr = {
+            "type": "ADD_ELEMENTWISE",
+            "input": target_index,
+            "parameters": pw[id(self)],
+        }
+        model_structure["instructions"].append(instr)
         return target_index
 
 
