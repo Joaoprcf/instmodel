@@ -486,7 +486,7 @@ class ActivationComputation(ComputationOp):
     The compile_instructions method creates an in-place activation instruction.
     """
 
-    def __init__(self, activation, in_place=True, name: Optional[str] = None):
+    def __init__(self, activation, in_place=False, name: Optional[str] = None):
         super().__init__()
         self.in_place = in_place
         self.activation = activation.upper()
@@ -547,6 +547,46 @@ class ActivationComputation(ComputationOp):
         }
         model_structure["instructions"].append(instr)
         return target_index
+
+
+class ReduceSum(ComputationOp):
+    """
+    Sums all elements of the input buffer, producing a single output value.
+    No trainable parameters.
+
+    Input: (batch, N) → Output: (batch, 1)
+    """
+
+    def __init__(self, name: Optional[str] = None):
+        super().__init__()
+        self.name = name
+        self.keras_layer = layers.Lambda(
+            lambda x: tf.reduce_sum(x, axis=-1, keepdims=True),
+            name=name,
+        )
+
+    def __call__(self, inputs):
+        if not isinstance(inputs, list):
+            inputs = [inputs]
+        if len(inputs) != 1:
+            raise ValueError("ReduceSum expects exactly one input.")
+        output_tensor = self.keras_layer(inputs[0].tensor)
+        return DataBuffer(output_tensor, op=self, inputs=inputs)
+
+    def compile_instructions(self, input_indices, weights_visited, model_structure):
+        if len(input_indices) != 1:
+            raise ValueError("ReduceSum expects exactly one input.")
+
+        output_index = len(model_structure["buffer_sizes"])
+        model_structure["buffer_sizes"].append(1)
+
+        instr = {
+            "type": "REDUCE_SUM",
+            "input": input_indices[0],
+            "output": output_index,
+        }
+        model_structure["instructions"].append(instr)
+        return output_index
 
 
 class Dense(ComputationOp):
@@ -937,7 +977,7 @@ class NormalizationComputation(ComputationOp):
     A normalization operation that wraps a BatchNormalization layer.
     """
 
-    def __init__(self, in_place=True, center=True, scale=True, epsilon=1e-3, name=None):
+    def __init__(self, in_place=False, center=True, scale=True, epsilon=1e-3, name=None):
         super().__init__()
         self.in_place = in_place
         self.epsilon = epsilon
@@ -1029,7 +1069,7 @@ class ScaleVectorized(ComputationOp):
     Compiles to a MUL_ELEMENTWISE instruction.
     """
 
-    def __init__(self, scaling_vector, in_place=True, name=None):
+    def __init__(self, scaling_vector, in_place=False, name=None):
         super().__init__()
         self.scaling_vector = np.asarray(scaling_vector, dtype=np.float32)
         self.in_place = in_place
@@ -1087,7 +1127,7 @@ class ShiftVectorized(ComputationOp):
     Compiles to an ADD_ELEMENTWISE instruction.
     """
 
-    def __init__(self, shift_vector, in_place=True, name=None):
+    def __init__(self, shift_vector, in_place=False, name=None):
         super().__init__()
         self.shift_vector = np.asarray(shift_vector, dtype=np.float32)
         self.in_place = in_place

@@ -7,6 +7,7 @@ from instmodel.model import (
     SingleIdEmbeddings,
     MultiIdEmbeddings,
     Add,
+    ReduceSum,
     ScaleVectorized,
     ShiftVectorized,
     ff_model,
@@ -546,13 +547,13 @@ def test_embeddings(capsys):
 
 def test_scale_and_shift_vectorized():
     """
-    Tests ScaleVectorized and ShiftVectorized operations.
+    Tests ScaleVectorized and ShiftVectorized operations with in_place=True.
     """
     input_buffer = InputBuffer(3)
 
-    # Apply scaling by [2, 0.5, 3] then shift by [1, -1, 0]
-    scaled = ScaleVectorized([2.0, 0.5, 3.0])(input_buffer)
-    shifted = ShiftVectorized([1.0, -1.0, 0.0])(scaled)
+    # Apply scaling by [2, 0.5, 3] then shift by [1, -1, 0] (in-place)
+    scaled = ScaleVectorized([2.0, 0.5, 3.0], in_place=True)(input_buffer)
+    shifted = ShiftVectorized([1.0, -1.0, 0.0], in_place=True)(scaled)
 
     model = ModelGraph(input_buffer, shifted)
 
@@ -626,3 +627,63 @@ def test_scale_and_shift_not_inplace():
             {"type": "ADD_ELEMENTWISE", "input": 2, "parameters": 1},
         ],
     }
+
+
+def test_reduce_sum():
+    """
+    Tests ReduceSum layer that sums all elements of the input buffer.
+    Input: (batch, N) → Output: (batch, 1)
+    """
+    input_buffer = InputBuffer(5)
+    summed = ReduceSum()(input_buffer)
+
+    model = ModelGraph(input_buffer, summed)
+
+    # Test with sample data
+    x_data = np.array([[1.0, 2.0, 3.0, 4.0, 5.0], [0.5, 1.5, 2.5, 3.5, 4.5]], dtype=np.float32)
+
+    # Expected: sum along last axis with keepdims=True
+    expected = np.array([[15.0], [12.5]], dtype=np.float32)
+
+    keras_pred = model.predict_on_batch(x_data)
+    assert np.allclose(keras_pred, expected, atol=1e-6)
+
+    # Validate instruction model matches Keras
+    inst_model = model.create_instruction_model()
+
+    # Verify instruction structure
+    assert inst_model["buffer_sizes"] == [5, 1]
+    assert inst_model["instructions"] == [
+        {"type": "REDUCE_SUM", "input": 0, "output": 1}
+    ]
+
+    inst_model["validation_data"] = {
+        "inputs": x_data.tolist(),
+        "expected_outputs": keras_pred.tolist(),
+    }
+    validate_instruction_model(inst_model)
+
+
+def test_reduce_sum_in_pipeline():
+    """
+    Tests ReduceSum as part of a larger computation pipeline.
+    """
+    input_buffer = InputBuffer(4)
+    hidden = Dense(8, activation="relu")(input_buffer)
+    summed = ReduceSum()(hidden)
+
+    model = ModelGraph(input_buffer, summed)
+
+    x_data = np.random.randn(10, 4).astype(np.float32)
+    keras_pred = model.predict_on_batch(x_data)
+
+    # Output should be (10, 1)
+    assert keras_pred.shape == (10, 1)
+
+    # Validate instruction model matches Keras
+    inst_model = model.create_instruction_model()
+    inst_model["validation_data"] = {
+        "inputs": x_data.tolist(),
+        "expected_outputs": keras_pred.tolist(),
+    }
+    validate_instruction_model(inst_model)

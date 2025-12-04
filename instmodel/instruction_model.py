@@ -181,6 +181,13 @@ def instruction_model_inference(model, input_data):
             buffers[output_index] = np.array(result, dtype=np.float32)
             continue
 
+        elif instruction["type"] == "REDUCE_SUM":
+            input_index = instruction["input"]
+            output_index = instruction["output"]
+            result = np.sum(buffers[input_index], axis=-1, keepdims=True)
+            buffers[output_index] = np.array(result, dtype=np.float32)
+            continue
+
         # --- Existing instructions (where "input" is a single index) --
         # In these cases we assume "input" is an integer.
         input_index = instruction["input"]
