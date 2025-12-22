@@ -687,3 +687,79 @@ def test_reduce_sum_in_pipeline():
         "expected_outputs": keras_pred.tolist(),
     }
     validate_instruction_model(inst_model)
+
+
+def test_gelu_activation():
+    """
+    Tests the GeLU activation function matching TensorFlow's default (exact erf-based).
+    Verifies both the Dense layer with gelu and the ff_model shorthand 'g'.
+    """
+    from scipy.special import erf
+
+    # Test 1: Simple model with GeLU activation
+    input_buffer = InputBuffer(4)
+    hidden = Dense(8, activation="gelu", name="hidden_gelu")(input_buffer)
+    output = Dense(1, activation="sigmoid", name="output_sigmoid")(hidden)
+
+    model_graph = ModelGraph(input_buffer, output)
+    model_graph.compile(optimizer="adam", loss="binary_crossentropy")
+
+    x_data = np.random.random((10, 4)).astype(np.float32)
+    y_data = np.random.randint(0, 2, size=(10, 1))
+
+    model_graph.fit(x_data, y_data, epochs=1, verbose=0)
+
+    instruction_model = model_graph.create_instruction_model()
+
+    keras_pred = model_graph.predict(x_data, verbose=0)
+    instruction_model["validation_data"] = {
+        "inputs": x_data.tolist(),
+        "expected_outputs": keras_pred.tolist(),
+    }
+
+    validate_instruction_model(instruction_model)
+    validate_keras_model(model_graph.get_keras(), instruction_model["validation_data"])
+
+    # Check instruction structure
+    assert instruction_model["instructions"][0]["activation"] == "GELU"
+    assert instruction_model["instructions"][1]["activation"] == "SIGMOID"
+
+    # Test 2: ff_model with 'g' shorthand for gelu
+    model_graph_ff = ff_model([4, 8, 1], NO_BATCH_NORM, "gs")
+
+    instruction_model_ff = model_graph_ff.create_instruction_model()
+
+    # Verify instruction structure matches
+    assert instruction_model_ff["instructions"][0]["activation"] == "GELU"
+    assert instruction_model_ff["instructions"][1]["activation"] == "SIGMOID"
+
+    # Test 3: Verify NumPy GeLU matches TensorFlow exactly
+    test_input = np.array([[-2.0, -1.0, 0.0, 1.0, 2.0]], dtype=np.float32)
+
+    # TensorFlow GeLU (default, exact)
+    tf_gelu = tf.nn.gelu(test_input, approximate=False).numpy()
+
+    # NumPy GeLU using our implementation
+    numpy_gelu = test_input * 0.5 * (1 + erf(test_input / np.sqrt(2)))
+
+    assert np.allclose(tf_gelu, numpy_gelu, atol=1e-6), (
+        f"NumPy GeLU does not match TensorFlow GeLU. "
+        f"TF: {tf_gelu}, NumPy: {numpy_gelu}"
+    )
+
+    # Test 4: Verify instruction model inference matches Keras with GeLU
+    input_buffer2 = InputBuffer(5)
+    gelu_layer = Dense(10, activation="gelu")(input_buffer2)
+    output2 = Dense(3)(gelu_layer)
+
+    model2 = ModelGraph(input_buffer2, output2)
+
+    x_data2 = np.random.randn(20, 5).astype(np.float32)
+    keras_pred2 = model2.predict(x_data2, verbose=0)
+
+    inst_model2 = model2.create_instruction_model()
+    *_, inst_output = instruction_model_inference(inst_model2, x_data2)
+
+    assert np.allclose(inst_output, keras_pred2, atol=1e-6), (
+        "Instruction model GeLU output does not match Keras output."
+    )

@@ -85,6 +85,7 @@ def ff_model(sizes: list[int], use_batch_norm: int = 0, activations=None):
             "r": "relu",
             "s": "sigmoid",
             "t": "tanh",
+            "g": "gelu",
             "l": None,
         }
         activations = [activation_map[activation] for activation in activations]
@@ -480,7 +481,7 @@ class ComputationOp(ABC):
 class ActivationComputation(ComputationOp):
     """
     An activation operation that applies an activation function elementwise.
-    For "RELU", "SIGMOID", "TANH", "SOFTMAX", the native Keras Activation layer is used.
+    For "RELU", "SIGMOID", "TANH", "SOFTMAX", "GELU", the native Keras Activation layer is used.
     For custom activations (e.g., "SQRT", "LOG", "LOG10", "INVERSE"), a layers.Lambda layer is created.
 
     The compile_instructions method creates an in-place activation instruction.
@@ -491,7 +492,7 @@ class ActivationComputation(ComputationOp):
         self.in_place = in_place
         self.activation = activation.upper()
         self.name = name
-        if self.activation in {"RELU", "SIGMOID", "TANH", "SOFTMAX"}:
+        if self.activation in {"RELU", "SIGMOID", "TANH", "SOFTMAX", "GELU"}:
             self.keras_layer = tf.keras.layers.Activation(
                 self.activation.lower(), name=name
             )

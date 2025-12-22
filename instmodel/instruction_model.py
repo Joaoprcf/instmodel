@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.special import erf
 import json
 import os
 import pandas as pd
@@ -98,6 +99,11 @@ def apply_activation(instruction, buffers, output_index):
     elif act == "INVERSE":
         # Compute 1 - x
         buffers[output_index] = 1 - x
+
+    elif act == "GELU":
+        # GeLU using the exact erf formulation (matches TensorFlow default)
+        # GeLU(x) = x * 0.5 * (1 + erf(x / sqrt(2)))
+        buffers[output_index] = x * 0.5 * (1 + erf(x / np.sqrt(2)))
 
     else:
         raise ValueError(f"Unexpected activation: {act}")
