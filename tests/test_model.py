@@ -629,6 +629,66 @@ def test_scale_and_shift_not_inplace():
     }
 
 
+def test_scale_vectorized_scalar():
+    """
+    Tests ScaleVectorized with a single scalar value that broadcasts to all elements.
+    """
+    input_buffer = InputBuffer(4)
+
+    # Scalar 2.0 should multiply all 4 elements
+    scaled = ScaleVectorized(2.0, in_place=True)(input_buffer)
+    model = ModelGraph(input_buffer, scaled)
+
+    result = model.create_instruction_model()
+
+    # Parameter should be expanded to [2.0, 2.0, 2.0, 2.0]
+    assert result["parameters"][0] == [2.0, 2.0, 2.0, 2.0]
+
+    # Numerical test
+    x_data = np.array([[1.0, 2.0, 3.0, 4.0], [0.5, -1.0, 0.0, 2.0]])
+    keras_pred = model.predict(x_data, verbose=0)
+    expected = x_data * 2.0
+    assert np.allclose(keras_pred, expected, atol=1e-6)
+
+    # Validate instruction model
+    inst_model = model.create_instruction_model()
+    inst_model["validation_data"] = {
+        "inputs": x_data.tolist(),
+        "expected_outputs": keras_pred.tolist(),
+    }
+    validate_instruction_model(inst_model)
+
+
+def test_shift_vectorized_scalar():
+    """
+    Tests ShiftVectorized with a single scalar value that broadcasts to all elements.
+    """
+    input_buffer = InputBuffer(3)
+
+    # Scalar 5.0 should be added to all 3 elements
+    shifted = ShiftVectorized(5.0, in_place=True)(input_buffer)
+    model = ModelGraph(input_buffer, shifted)
+
+    result = model.create_instruction_model()
+
+    # Parameter should be expanded to [5.0, 5.0, 5.0]
+    assert result["parameters"][0] == [5.0, 5.0, 5.0]
+
+    # Numerical test
+    x_data = np.array([[1.0, 2.0, 3.0], [-1.0, 0.0, 10.0]])
+    keras_pred = model.predict(x_data, verbose=0)
+    expected = x_data + 5.0
+    assert np.allclose(keras_pred, expected, atol=1e-6)
+
+    # Validate instruction model
+    inst_model = model.create_instruction_model()
+    inst_model["validation_data"] = {
+        "inputs": x_data.tolist(),
+        "expected_outputs": keras_pred.tolist(),
+    }
+    validate_instruction_model(inst_model)
+
+
 def test_reduce_sum():
     """
     Tests ReduceSum layer that sums all elements of the input buffer.

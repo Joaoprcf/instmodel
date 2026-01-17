@@ -1072,10 +1072,18 @@ class ScaleVectorized(ComputationOp):
 
     def __init__(self, scaling_vector, in_place=False, name=None):
         super().__init__()
-        self.scaling_vector = np.asarray(scaling_vector, dtype=np.float32)
+        arr = np.asarray(scaling_vector, dtype=np.float32)
+        self._is_scalar = arr.ndim == 0 or (arr.ndim == 1 and arr.size == 1)
+        if self._is_scalar:
+            self._scalar_value = float(arr.flat[0])
+            self.scaling_vector = None
+            self._scaling_tensor = tf.constant(self._scalar_value, dtype=tf.float32)
+        else:
+            self._scalar_value = None
+            self.scaling_vector = arr
+            self._scaling_tensor = tf.constant(self.scaling_vector, dtype=tf.float32)
         self.in_place = in_place
         self.name = name
-        self._scaling_tensor = tf.constant(self.scaling_vector, dtype=tf.float32)
         self.keras_layer = layers.Lambda(
             lambda x: x * self._scaling_tensor, name=name
         )
@@ -1111,7 +1119,12 @@ class ScaleVectorized(ComputationOp):
 
         if id(self) not in pw:
             pw[id(self)] = len(model_structure["parameters"])
-            model_structure["parameters"].append(self.scaling_vector.tolist())
+            if self._is_scalar:
+                buffer_size = model_structure["buffer_sizes"][input_indices[0]]
+                expanded_vector = [self._scalar_value] * buffer_size
+                model_structure["parameters"].append(expanded_vector)
+            else:
+                model_structure["parameters"].append(self.scaling_vector.tolist())
 
         instr = {
             "type": "MUL_ELEMENTWISE",
@@ -1130,10 +1143,18 @@ class ShiftVectorized(ComputationOp):
 
     def __init__(self, shift_vector, in_place=False, name=None):
         super().__init__()
-        self.shift_vector = np.asarray(shift_vector, dtype=np.float32)
+        arr = np.asarray(shift_vector, dtype=np.float32)
+        self._is_scalar = arr.ndim == 0 or (arr.ndim == 1 and arr.size == 1)
+        if self._is_scalar:
+            self._scalar_value = float(arr.flat[0])
+            self.shift_vector = None
+            self._shift_tensor = tf.constant(self._scalar_value, dtype=tf.float32)
+        else:
+            self._scalar_value = None
+            self.shift_vector = arr
+            self._shift_tensor = tf.constant(self.shift_vector, dtype=tf.float32)
         self.in_place = in_place
         self.name = name
-        self._shift_tensor = tf.constant(self.shift_vector, dtype=tf.float32)
         self.keras_layer = layers.Lambda(
             lambda x: x + self._shift_tensor, name=name
         )
@@ -1169,7 +1190,12 @@ class ShiftVectorized(ComputationOp):
 
         if id(self) not in pw:
             pw[id(self)] = len(model_structure["parameters"])
-            model_structure["parameters"].append(self.shift_vector.tolist())
+            if self._is_scalar:
+                buffer_size = model_structure["buffer_sizes"][input_indices[0]]
+                expanded_vector = [self._scalar_value] * buffer_size
+                model_structure["parameters"].append(expanded_vector)
+            else:
+                model_structure["parameters"].append(self.shift_vector.tolist())
 
         instr = {
             "type": "ADD_ELEMENTWISE",
