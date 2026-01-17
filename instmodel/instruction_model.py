@@ -187,6 +187,30 @@ def instruction_model_inference(model, input_data):
             buffers[output_index] = np.array(result, dtype=np.float32)
             continue
 
+        elif instruction["type"] == "MULTIPLY_BUFFER_HEADS":
+            data_idx, heads_idx = instruction["input"]
+            output_index = instruction["output"]
+            data_buf = buffers[data_idx]
+            heads_buf = buffers[heads_idx]
+            data_size = data_buf.shape[1]
+            heads_size = heads_buf.shape[1]
+            head_dim = data_size // heads_size
+            expanded = np.repeat(heads_buf, repeats=head_dim, axis=1)
+            buffers[output_index] = np.array(data_buf * expanded, dtype=np.float32)
+            continue
+
+        elif instruction["type"] == "ADD_BUFFER_HEADS":
+            data_idx, heads_idx = instruction["input"]
+            output_index = instruction["output"]
+            data_buf = buffers[data_idx]
+            heads_buf = buffers[heads_idx]
+            data_size = data_buf.shape[1]
+            heads_size = heads_buf.shape[1]
+            head_dim = data_size // heads_size
+            expanded = np.repeat(heads_buf, repeats=head_dim, axis=1)
+            buffers[output_index] = np.array(data_buf + expanded, dtype=np.float32)
+            continue
+
         elif instruction["type"] == "REDUCE_SUM":
             input_index = instruction["input"]
             output_index = instruction["output"]

@@ -7,6 +7,8 @@ from instmodel.model import (
     SingleIdEmbeddings,
     MultiIdEmbeddings,
     Add,
+    AddHeads,
+    MultiplyHeads,
     ReduceSum,
     ScaleVectorized,
     ShiftVectorized,
@@ -823,3 +825,86 @@ def test_gelu_activation():
     assert np.allclose(inst_output, keras_pred2, atol=1e-6), (
         "Instruction model GeLU output does not match Keras output."
     )
+
+
+def test_multiply_heads():
+    """
+    Tests MultiplyHeads operation with 4 heads on a size-20 buffer.
+    """
+    # Simulate 4 concatenated embeddings of size 5
+    data_buffer = InputBuffer(20)
+    # Attention weights for 4 heads
+    attention_buffer = InputBuffer(4)
+
+    # Apply attention via MultiplyHeads
+    result = MultiplyHeads()([data_buffer, attention_buffer])
+    model = ModelGraph([data_buffer, attention_buffer], result)
+
+    # Test data
+    data = np.array([[1.0] * 20])  # All ones
+    attention = np.array([[2.0, 3.0, 4.0, 5.0]])  # Different weight per head
+
+    keras_pred = model.predict([data, attention], verbose=0)
+
+    # Expected: first 5 elements * 2, next 5 * 3, next 5 * 4, last 5 * 5
+    expected = np.array([[2.0] * 5 + [3.0] * 5 + [4.0] * 5 + [5.0] * 5])
+    assert np.allclose(keras_pred, expected, atol=1e-6)
+
+    # Validate instruction model
+    inst_model = model.create_instruction_model()
+    assert inst_model["instructions"][-1]["type"] == "MULTIPLY_BUFFER_HEADS"
+
+    # Validate using instruction_model_inference directly (supports list inputs)
+    *_, inst_output = instruction_model_inference(inst_model, [data, attention])
+    assert np.allclose(inst_output, keras_pred, atol=1e-6)
+
+
+def test_add_heads():
+    """
+    Tests AddHeads operation with 4 heads on a size-20 buffer.
+    """
+    data_buffer = InputBuffer(20)
+    attention_buffer = InputBuffer(4)
+
+    result = AddHeads()([data_buffer, attention_buffer])
+    model = ModelGraph([data_buffer, attention_buffer], result)
+
+    data = np.array([[0.0] * 20])  # All zeros
+    attention = np.array([[1.0, 2.0, 3.0, 4.0]])
+
+    keras_pred = model.predict([data, attention], verbose=0)
+
+    # Expected: first 5 + 1, next 5 + 2, etc.
+    expected = np.array([[1.0] * 5 + [2.0] * 5 + [3.0] * 5 + [4.0] * 5])
+    assert np.allclose(keras_pred, expected, atol=1e-6)
+
+    inst_model = model.create_instruction_model()
+    assert inst_model["instructions"][-1]["type"] == "ADD_BUFFER_HEADS"
+
+    # Validate using instruction_model_inference directly (supports list inputs)
+    *_, inst_output = instruction_model_inference(inst_model, [data, attention])
+    assert np.allclose(inst_output, keras_pred, atol=1e-6)
+
+
+def test_multiply_heads_scalar():
+    """
+    Tests MultiplyHeads when second buffer is size 1 (scalar broadcast).
+    """
+    data_buffer = InputBuffer(10)
+    scalar_buffer = InputBuffer(1)
+
+    result = MultiplyHeads()([data_buffer, scalar_buffer])
+    model = ModelGraph([data_buffer, scalar_buffer], result)
+
+    data = np.array([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]])
+    scalar = np.array([[2.0]])
+
+    keras_pred = model.predict([data, scalar], verbose=0)
+    expected = data * 2.0
+    assert np.allclose(keras_pred, expected, atol=1e-6)
+
+    inst_model = model.create_instruction_model()
+
+    # Validate using instruction_model_inference directly (supports list inputs)
+    *_, inst_output = instruction_model_inference(inst_model, [data, scalar])
+    assert np.allclose(inst_output, keras_pred, atol=1e-6)

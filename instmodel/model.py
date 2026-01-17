@@ -1341,6 +1341,120 @@ class Multiply(ComputationOp):
         return output_index
 
 
+class MultiplyHeads(ComputationOp):
+    """
+    Multiplies a data buffer by a smaller heads buffer, broadcasting each head value
+    across its corresponding segment.
+
+    Example: data(20) * heads(4) -> each group of 5 elements multiplied by corresponding head value
+    Constraint: size of first buffer must be divisible by size of second buffer.
+    """
+
+    def __init__(self, name: Optional[str] = None):
+        super().__init__()
+        self.name = name
+        self.head_dim = None
+        self.keras_layer = None
+
+    def __call__(self, inputs):
+        if not isinstance(inputs, list) or len(inputs) != 2:
+            raise ValueError("MultiplyHeads expects exactly two inputs.")
+        data_buffer, heads_buffer = inputs
+        data_size = data_buffer.os
+        heads_size = heads_buffer.os
+        if data_size % heads_size != 0:
+            raise ValueError(
+                f"Data buffer size ({data_size}) must be divisible by heads buffer size ({heads_size})."
+            )
+        self.head_dim = data_size // heads_size
+        head_dim = self.head_dim
+        self.keras_layer = layers.Lambda(
+            lambda x: x[0] * tf.repeat(x[1], repeats=head_dim, axis=-1),
+            name=self.name,
+        )
+        output_tensor = self.keras_layer([data_buffer.tensor, heads_buffer.tensor])
+        return DataBuffer(output_tensor, op=self, inputs=inputs)
+
+    def compile_instructions(
+        self, input_indices, weights_visited, model_structure
+    ) -> int:
+        if len(input_indices) != 2:
+            raise ValueError("MultiplyHeads expects exactly two inputs.")
+        data_idx, heads_idx = input_indices
+        data_size = model_structure["buffer_sizes"][data_idx]
+        heads_size = model_structure["buffer_sizes"][heads_idx]
+        if data_size % heads_size != 0:
+            raise ValueError(
+                f"Data buffer size ({data_size}) must be divisible by heads buffer size ({heads_size})."
+            )
+        output_index = len(model_structure["buffer_sizes"])
+        model_structure["buffer_sizes"].append(data_size)
+        instr = {
+            "type": "MULTIPLY_BUFFER_HEADS",
+            "input": [data_idx, heads_idx],
+            "output": output_index,
+        }
+        model_structure["instructions"].append(instr)
+        return output_index
+
+
+class AddHeads(ComputationOp):
+    """
+    Adds a smaller heads buffer to a data buffer, broadcasting each head value
+    across its corresponding segment.
+
+    Example: data(20) + heads(4) -> each group of 5 elements has corresponding head value added
+    Constraint: size of first buffer must be divisible by size of second buffer.
+    """
+
+    def __init__(self, name: Optional[str] = None):
+        super().__init__()
+        self.name = name
+        self.head_dim = None
+        self.keras_layer = None
+
+    def __call__(self, inputs):
+        if not isinstance(inputs, list) or len(inputs) != 2:
+            raise ValueError("AddHeads expects exactly two inputs.")
+        data_buffer, heads_buffer = inputs
+        data_size = data_buffer.os
+        heads_size = heads_buffer.os
+        if data_size % heads_size != 0:
+            raise ValueError(
+                f"Data buffer size ({data_size}) must be divisible by heads buffer size ({heads_size})."
+            )
+        self.head_dim = data_size // heads_size
+        head_dim = self.head_dim
+        self.keras_layer = layers.Lambda(
+            lambda x: x[0] + tf.repeat(x[1], repeats=head_dim, axis=-1),
+            name=self.name,
+        )
+        output_tensor = self.keras_layer([data_buffer.tensor, heads_buffer.tensor])
+        return DataBuffer(output_tensor, op=self, inputs=inputs)
+
+    def compile_instructions(
+        self, input_indices, weights_visited, model_structure
+    ) -> int:
+        if len(input_indices) != 2:
+            raise ValueError("AddHeads expects exactly two inputs.")
+        data_idx, heads_idx = input_indices
+        data_size = model_structure["buffer_sizes"][data_idx]
+        heads_size = model_structure["buffer_sizes"][heads_idx]
+        if data_size % heads_size != 0:
+            raise ValueError(
+                f"Data buffer size ({data_size}) must be divisible by heads buffer size ({heads_size})."
+            )
+        output_index = len(model_structure["buffer_sizes"])
+        model_structure["buffer_sizes"].append(data_size)
+        instr = {
+            "type": "ADD_BUFFER_HEADS",
+            "input": [data_idx, heads_idx],
+            "output": output_index,
+        }
+        model_structure["instructions"].append(instr)
+        return output_index
+
+
 ###############################################################################
 # 3. ModelGraph and Instruction Model Compilation
 ###############################################################################
