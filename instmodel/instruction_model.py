@@ -105,6 +105,20 @@ def apply_activation(instruction, buffers, output_index):
         # GeLU(x) = x * 0.5 * (1 + erf(x / sqrt(2)))
         buffers[output_index] = x * 0.5 * (1 + erf(x / np.sqrt(2)))
 
+    elif act == "SOFTPLUS":
+        # Match TensorFlow's Eigen implementation structure:
+        # threshold = log(eps) + 2 ≈ -13.94 for float32
+        # x > -threshold: return x (softplus ≈ x for large positive)
+        # x < threshold: return exp(x) (softplus ≈ exp(x) for large negative)
+        # otherwise: return log1p(exp(x))
+        threshold = np.float32(np.log(np.finfo(np.float32).eps) + 2)
+        result = np.where(
+            x > -threshold,
+            x,
+            np.where(x < threshold, np.exp(x), np.log1p(np.exp(x)))
+        )
+        buffers[output_index] = result
+
     else:
         raise ValueError(f"Unexpected activation: {act}")
 

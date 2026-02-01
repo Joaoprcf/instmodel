@@ -827,6 +827,81 @@ def test_gelu_activation():
     )
 
 
+def test_softplus_activation():
+    """
+    Tests the Softplus activation function.
+    Verifies both the Dense layer with softplus and the ff_model shorthand 'p'.
+    """
+    # Test 1: Simple model with Softplus activation
+    input_buffer = InputBuffer(4)
+    hidden = Dense(8, activation="softplus", name="hidden_softplus")(input_buffer)
+    output = Dense(1, activation="sigmoid", name="output_sigmoid")(hidden)
+
+    model_graph = ModelGraph(input_buffer, output)
+    model_graph.compile(optimizer="adam", loss="binary_crossentropy")
+
+    x_data = np.random.random((10, 4)).astype(np.float32)
+    y_data = np.random.randint(0, 2, size=(10, 1))
+
+    model_graph.fit(x_data, y_data, epochs=1, verbose=0)
+
+    instruction_model = model_graph.create_instruction_model()
+
+    keras_pred = model_graph.predict(x_data, verbose=0)
+    instruction_model["validation_data"] = {
+        "inputs": x_data.tolist(),
+        "expected_outputs": keras_pred.tolist(),
+    }
+
+    validate_instruction_model(instruction_model)
+    validate_keras_model(model_graph.get_keras(), instruction_model["validation_data"])
+
+    # Check instruction structure
+    assert instruction_model["instructions"][0]["activation"] == "SOFTPLUS"
+    assert instruction_model["instructions"][1]["activation"] == "SIGMOID"
+
+    # Test 2: ff_model with 'p' shorthand for softplus
+    model_graph_ff = ff_model([4, 8, 1], NO_BATCH_NORM, "ps")
+
+    instruction_model_ff = model_graph_ff.create_instruction_model()
+
+    # Verify instruction structure matches
+    assert instruction_model_ff["instructions"][0]["activation"] == "SOFTPLUS"
+    assert instruction_model_ff["instructions"][1]["activation"] == "SIGMOID"
+
+    # Test 3: Verify NumPy softplus matches TensorFlow exactly (including edge cases)
+    test_input = np.array([[-100.0, -10.0, -1.0, 0.0, 1.0, 10.0, 100.0]], dtype=np.float32)
+
+    # TensorFlow softplus
+    tf_softplus = tf.nn.softplus(test_input).numpy()
+
+    # NumPy softplus using our numerically stable implementation
+    # softplus(x) = max(x, 0) + log(1 + exp(-|x|))
+    numpy_softplus = np.maximum(test_input, 0) + np.log1p(np.exp(-np.abs(test_input)))
+
+    assert np.allclose(tf_softplus, numpy_softplus, atol=1e-6), (
+        f"NumPy softplus does not match TensorFlow softplus. "
+        f"TF: {tf_softplus}, NumPy: {numpy_softplus}"
+    )
+
+    # Test 4: Verify instruction model inference matches Keras with Softplus
+    input_buffer2 = InputBuffer(5)
+    softplus_layer = Dense(10, activation="softplus")(input_buffer2)
+    output2 = Dense(3)(softplus_layer)
+
+    model2 = ModelGraph(input_buffer2, output2)
+
+    x_data2 = np.random.randn(20, 5).astype(np.float32)
+    keras_pred2 = model2.predict(x_data2, verbose=0)
+
+    inst_model2 = model2.create_instruction_model()
+    *_, inst_output = instruction_model_inference(inst_model2, x_data2)
+
+    assert np.allclose(inst_output, keras_pred2, atol=1e-6), (
+        "Instruction model softplus output does not match Keras output."
+    )
+
+
 def test_multiply_heads():
     """
     Tests MultiplyHeads operation with 4 heads on a size-20 buffer.
