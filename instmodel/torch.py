@@ -1183,6 +1183,7 @@ class ModelGraph(ComputationOp):
         self._torch_module = _InternalModule(input_buffers, output_buffer).to(self._device)
         self._optimizer = None
         self._loss_fn = None
+        self._compiled_module = None
 
     @property
     def os(self):
@@ -1228,9 +1229,13 @@ class ModelGraph(ComputationOp):
         else:
             self._loss_fn = loss
 
+        self._compiled_module = torch.compile(self._torch_module)
+        return self._compiled_module
+
     def fit(self, x, y, epochs=1, batch_size=32, verbose=1, shuffle=True, sample_weight=None):
         device = self._device
-        self._torch_module.train()
+        module = self._compiled_module if self._compiled_module is not None else self._torch_module
+        module.train()
 
         if isinstance(x, list):
             x_tensors = [torch.tensor(np.asarray(xi), dtype=torch.float32, device=device) for xi in x]
@@ -1273,9 +1278,9 @@ class ModelGraph(ComputationOp):
 
                 self._optimizer.zero_grad()
                 if isinstance(x_batch, list):
-                    pred = self._torch_module(*x_batch)
+                    pred = module(*x_batch)
                 else:
-                    pred = self._torch_module(x_batch)
+                    pred = module(x_batch)
 
                 if w_epoch is not None:
                     w_batch = w_epoch[start:end]
@@ -1296,14 +1301,15 @@ class ModelGraph(ComputationOp):
 
     def predict(self, x, verbose=0):
         device = self._device
-        self._torch_module.eval()
+        module = self._compiled_module if self._compiled_module is not None else self._torch_module
+        module.eval()
         with torch.no_grad():
             if isinstance(x, list):
                 x_tensors = [torch.tensor(np.asarray(xi), dtype=torch.float32, device=device) for xi in x]
-                pred = self._torch_module(*x_tensors)
+                pred = module(*x_tensors)
             else:
                 x_tensor = torch.tensor(np.asarray(x), dtype=torch.float32, device=device)
-                pred = self._torch_module(x_tensor)
+                pred = module(x_tensor)
         return pred.cpu().numpy()
 
     def predict_on_batch(self, x):
