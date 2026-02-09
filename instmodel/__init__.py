@@ -6,13 +6,13 @@ from . import instruction_model
 from . import training_utils
 
 try:
-    import torch
-    from . import model_torch
+    import torch as _torch
+    from . import torch
 except ImportError:
     pass
 
 try:
-    import tensorflow
-    from . import model
+    import tensorflow as _tf
+    from . import tf
 except ImportError:
     pass

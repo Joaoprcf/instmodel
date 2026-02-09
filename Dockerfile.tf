@@ -17,4 +17,4 @@ RUN pip install --no-deps .
 COPY tests/ tests/
 
 # Default command to run when the container starts (can be changed)
-CMD ["sh", "-c", "pytest tests/test_model.py -v"]
+CMD ["sh", "-c", "pytest tests/test_tf.py -v"]

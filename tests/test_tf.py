@@ -1,4 +1,4 @@
-from instmodel.model import (
+from instmodel.tf import (
     Attention,
     Concatenate,
     Dense,

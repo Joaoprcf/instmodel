@@ -1,4 +1,4 @@
-from instmodel.model_torch import (
+from instmodel.torch import (
     Attention,
     Concatenate,
     Dense,
