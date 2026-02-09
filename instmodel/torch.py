@@ -1194,7 +1194,8 @@ class ModelGraph(ComputationOp):
     def get_module(self):
         return self._torch_module
 
-    def compile(self, optimizer="adam", loss="mse", lr=0.001, **kwargs):
+    def compile(self, optimizer="adam", loss="mse", lr=0.001, metrics=None, **kwargs):
+        self._metrics = metrics or []
         opt_map = {
             "adam": torch.optim.Adam,
             "sgd": torch.optim.SGD,
