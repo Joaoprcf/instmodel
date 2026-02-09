@@ -1,0 +1,21 @@
+FROM nvidia/cuda:13.1.0-runtime-ubuntu24.04
+
+WORKDIR /workspace
+
+RUN apt-get update && \
+    apt-get install -y python3 python3-pip python3-venv build-essential && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+RUN pip install --upgrade pip && \
+    pip install torch --index-url https://download.pytorch.org/whl/cu130 && \
+    pip install numpy pandas scipy scikit-learn
+
+COPY instmodel /workspace/instmodel
+COPY MANIFEST.in setup.py setup.cfg /workspace/
+
+RUN pip install --no-deps .
+
+CMD ["bash"]

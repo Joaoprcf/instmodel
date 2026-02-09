@@ -1,5 +1,5 @@
 # Base image: Use an official Python image with TensorFlow pre-installed
-FROM tensorflow/tensorflow:2.17.0
+FROM tensorflow/tensorflow:2.20.0
 
 # Set the working directory inside the container
 WORKDIR /app
@@ -17,4 +17,4 @@ RUN pip install --no-deps .
 COPY tests/ tests/
 
 # Default command to run when the container starts (can be changed)
-CMD ["sh", "-c", "pytest tests/test_*.py"]
+CMD ["sh", "-c", "pytest tests/test_model.py -v"]

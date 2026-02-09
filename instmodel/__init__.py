@@ -4,4 +4,15 @@
 
 from . import instruction_model
 from . import training_utils
-from . import model
+
+try:
+    import torch
+    from . import model_torch
+except ImportError:
+    pass
+
+try:
+    import tensorflow
+    from . import model
+except ImportError:
+    pass
