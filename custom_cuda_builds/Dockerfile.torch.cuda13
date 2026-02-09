@@ -10,5 +10,7 @@ RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 RUN pip install --upgrade pip && \
-    pip install torch --index-url https://download.pytorch.org/whl/cu130 && \
-    pip install instmodel[pytorch] pytest
+    pip install torch --index-url https://download.pytorch.org/whl/cu130
+
+ADD https://pypi.org/pypi/instmodel/json /tmp/pypi-instmodel.json
+RUN pip install instmodel[pytorch] pytest
