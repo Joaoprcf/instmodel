@@ -1301,7 +1301,10 @@ class ModelGraph(ComputationOp):
             history.append(avg_loss)
 
             if verbose:
-                print(f"Epoch {epoch + 1}/{epochs} - loss: {avg_loss:.4f}")
+                if abs(avg_loss) > 1e-3:
+                    print(f"Epoch {epoch + 1}/{epochs} - loss: {avg_loss:.4f}")
+                else:
+                    print(f"Epoch {epoch + 1}/{epochs} - loss: {avg_loss:.4e}")
 
         return history
 
