@@ -1251,6 +1251,8 @@ class ModelGraph(ComputationOp):
         else:
             w_tensor = None
 
+        history = []
+
         for epoch in range(epochs):
             if shuffle:
                 perm = torch.randperm(n_samples, device=device)
@@ -1295,9 +1297,13 @@ class ModelGraph(ComputationOp):
                 epoch_loss += loss.item()
                 n_batches += 1
 
+            avg_loss = epoch_loss / n_batches
+            history.append(avg_loss)
+
             if verbose:
-                avg_loss = epoch_loss / n_batches
                 print(f"Epoch {epoch + 1}/{epochs} - loss: {avg_loss:.4f}")
+
+        return history
 
     def predict(self, x, verbose=0):
         device = self._device
