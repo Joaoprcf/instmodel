@@ -1,4 +1,5 @@
 from instmodel.torch import (
+    ActivationComputation,
     Attention,
     Concatenate,
     Dense,
@@ -917,3 +918,75 @@ def test_multiply_heads_scalar():
 
     *_, inst_output = instruction_model_inference(inst_model, [data, scalar])
     assert np.allclose(inst_output, torch_pred, atol=1e-6)
+
+
+def test_exp_activation():
+    """Tests EXP activation: PyTorch, NumPy, and instruction model agree; clamped at [-88, 88]."""
+    from instmodel.torch import _apply_activation
+
+    x_np = np.array([-100.0, -88.0, -1.0, 0.0, 1.0, 88.0, 100.0], dtype=np.float32)
+    expected = np.exp(np.clip(x_np, -88, 88).astype(np.float64)).astype(np.float32)
+
+    # PyTorch backend
+    result_torch = _apply_activation(torch.tensor(x_np), "EXP").numpy()
+    assert np.allclose(result_torch, expected, atol=1e-6), (
+        f"PyTorch EXP mismatch: {result_torch} vs {expected}"
+    )
+
+    # ActivationComputation + ModelGraph round-trip
+    inp = InputBuffer(len(x_np))
+    out = ActivationComputation("EXP", in_place=False)(inp)
+    model = ModelGraph(inp, out)
+    model_pred = model.predict(x_np.reshape(1, -1), verbose=0).flatten()
+    assert np.allclose(model_pred, expected, atol=1e-6), (
+        f"ModelGraph EXP mismatch: {model_pred} vs {expected}"
+    )
+
+    # Instruction model round-trip
+    inst_model = model.create_instruction_model()
+    inst_model["validation_data"] = {
+        "inputs": x_np.reshape(1, -1).tolist(),
+        "expected_outputs": model_pred.reshape(1, -1).tolist(),
+    }
+    validate_instruction_model(inst_model)
+
+    # Clamping: exp(-100) == exp(-88), exp(100) == exp(88)
+    assert np.isclose(result_torch[0], result_torch[1], atol=1e-6), "EXP(-100) should be clamped to exp(-88)"
+    assert np.isclose(result_torch[-1], result_torch[-2], atol=1e-6), "EXP(100) should be clamped to exp(88)"
+
+
+def test_sign_activation():
+    """Tests SIGN activation: PyTorch, NumPy, and instruction model agree; returns -1, 0, or 1."""
+    from instmodel.torch import _apply_activation
+
+    x_np = np.array([-5.0, -0.01, 0.0, 0.01, 5.0], dtype=np.float32)
+    expected = np.array([-1.0, -1.0, 0.0, 1.0, 1.0], dtype=np.float32)
+
+    # PyTorch backend
+    result_torch = _apply_activation(torch.tensor(x_np), "SIGN").numpy()
+    assert np.array_equal(result_torch, expected), (
+        f"PyTorch SIGN mismatch: {result_torch} vs {expected}"
+    )
+
+    # ActivationComputation + ModelGraph round-trip
+    inp = InputBuffer(len(x_np))
+    out = ActivationComputation("SIGN", in_place=False)(inp)
+    model = ModelGraph(inp, out)
+    model_pred = model.predict(x_np.reshape(1, -1), verbose=0).flatten()
+    assert np.array_equal(model_pred, expected), (
+        f"ModelGraph SIGN mismatch: {model_pred} vs {expected}"
+    )
+
+    # Instruction model round-trip
+    inst_model = model.create_instruction_model()
+    inst_model["validation_data"] = {
+        "inputs": x_np.reshape(1, -1).tolist(),
+        "expected_outputs": model_pred.reshape(1, -1).tolist(),
+    }
+    validate_instruction_model(inst_model)
+
+    # RELU(SIGN(x)) == STEP(x)
+    step_expected = np.array([0.0, 0.0, 0.0, 1.0, 1.0], dtype=np.float32)
+    assert np.array_equal(np.maximum(0, result_torch), step_expected), (
+        "RELU(SIGN(x)) should produce step function"
+    )

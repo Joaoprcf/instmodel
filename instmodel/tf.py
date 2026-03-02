@@ -512,6 +512,12 @@ class ActivationComputation(ComputationOp):
             )
         elif self.activation == "INVERSE":
             self.keras_layer = layers.Lambda(lambda x: 1 - x, name=name)
+        elif self.activation == "EXP":
+            self.keras_layer = layers.Lambda(
+                lambda x: tf.exp(tf.clip_by_value(x, -88, 88)), name=name
+            )
+        elif self.activation == "SIGN":
+            self.keras_layer = layers.Lambda(lambda x: tf.sign(x), name=name)
         else:
             raise ValueError(f"Unexpected activation: {self.activation}")
 

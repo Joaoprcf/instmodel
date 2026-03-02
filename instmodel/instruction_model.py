@@ -119,6 +119,14 @@ def apply_activation(instruction, buffers, output_index):
         )
         buffers[output_index] = result
 
+    elif act == "EXP":
+        # Clamp to [-88, 88] to avoid float32 overflow/underflow
+        buffers[output_index] = np.exp(np.clip(x, -88, 88))
+
+    elif act == "SIGN":
+        # sign(x): -1 for x < 0, 0 for x == 0, 1 for x > 0
+        buffers[output_index] = np.sign(x)
+
     else:
         raise ValueError(f"Unexpected activation: {act}")
 

@@ -1,4 +1,5 @@
 from instmodel.tf import (
+    ActivationComputation,
     Attention,
     Concatenate,
     Dense,
@@ -983,3 +984,59 @@ def test_multiply_heads_scalar():
     # Validate using instruction_model_inference directly (supports list inputs)
     *_, inst_output = instruction_model_inference(inst_model, [data, scalar])
     assert np.allclose(inst_output, keras_pred, atol=1e-6)
+
+
+def test_exp_activation():
+    """Tests EXP activation: Keras Lambda, NumPy, and instruction model agree; clamped at [-88, 88]."""
+    x_np = np.array([-100.0, -88.0, -1.0, 0.0, 1.0, 88.0, 100.0], dtype=np.float32)
+    expected = np.exp(np.clip(x_np, -88, 88).astype(np.float64)).astype(np.float32)
+
+    # TF/Keras backend via ActivationComputation
+    inp = InputBuffer(len(x_np))
+    out = ActivationComputation("EXP", in_place=False)(inp)
+    model = ModelGraph(inp, out)
+    result_tf = model.predict(x_np.reshape(1, -1), verbose=0).flatten()
+    assert np.allclose(result_tf, expected, atol=1e-6), (
+        f"TF EXP mismatch: {result_tf} vs {expected}"
+    )
+
+    # Instruction model round-trip
+    inst_model = model.create_instruction_model()
+    inst_model["validation_data"] = {
+        "inputs": x_np.reshape(1, -1).tolist(),
+        "expected_outputs": result_tf.reshape(1, -1).tolist(),
+    }
+    validate_instruction_model(inst_model)
+
+    # Clamping: exp(-100) == exp(-88), exp(100) == exp(88)
+    assert np.isclose(result_tf[0], result_tf[1], atol=1e-6), "EXP(-100) should be clamped to exp(-88)"
+    assert np.isclose(result_tf[-1], result_tf[-2], atol=1e-6), "EXP(100) should be clamped to exp(88)"
+
+
+def test_sign_activation():
+    """Tests SIGN activation: Keras Lambda, NumPy, and instruction model agree; returns -1, 0, or 1."""
+    x_np = np.array([-5.0, -0.01, 0.0, 0.01, 5.0], dtype=np.float32)
+    expected = np.array([-1.0, -1.0, 0.0, 1.0, 1.0], dtype=np.float32)
+
+    # TF/Keras backend via ActivationComputation
+    inp = InputBuffer(len(x_np))
+    out = ActivationComputation("SIGN", in_place=False)(inp)
+    model = ModelGraph(inp, out)
+    result_tf = model.predict(x_np.reshape(1, -1), verbose=0).flatten()
+    assert np.array_equal(result_tf, expected), (
+        f"TF SIGN mismatch: {result_tf} vs {expected}"
+    )
+
+    # Instruction model round-trip
+    inst_model = model.create_instruction_model()
+    inst_model["validation_data"] = {
+        "inputs": x_np.reshape(1, -1).tolist(),
+        "expected_outputs": result_tf.reshape(1, -1).tolist(),
+    }
+    validate_instruction_model(inst_model)
+
+    # RELU(SIGN(x)) == STEP(x)
+    step_expected = np.array([0.0, 0.0, 0.0, 1.0, 1.0], dtype=np.float32)
+    assert np.array_equal(np.maximum(0, result_tf), step_expected), (
+        "RELU(SIGN(x)) should produce step function"
+    )

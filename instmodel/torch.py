@@ -48,6 +48,10 @@ def _apply_activation(x: torch.Tensor, activation: str) -> torch.Tensor:
         )
     elif act == "INVERSE":
         return 1 - x
+    elif act == "EXP":
+        return torch.exp(torch.clamp(x, -88, 88))
+    elif act == "SIGN":
+        return torch.sign(x)
     else:
         raise ValueError(f"Unexpected activation: {activation}")
 
