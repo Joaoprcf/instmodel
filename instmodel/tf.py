@@ -1213,6 +1213,132 @@ class ShiftVectorized(ComputationOp):
         return target_index
 
 
+class ClipVectorized(ComputationOp):
+    """
+    Clips a buffer elementwise by fixed min/max vectors.
+    Compiles to a CLIP_ELEMENTWISE instruction.
+    """
+
+    def __init__(self, clip_min=None, clip_max=None, in_place=False, name=None):
+        super().__init__()
+        if clip_min is None and clip_max is None:
+            raise ValueError("ClipVectorized requires at least one of clip_min or clip_max.")
+
+        self.in_place = in_place
+        self.name = name
+        self._has_min = clip_min is not None
+        self._has_max = clip_max is not None
+
+        if self._has_min:
+            arr = np.asarray(clip_min, dtype=np.float32)
+            self._min_is_scalar = arr.ndim == 0 or (arr.ndim == 1 and arr.size == 1)
+            if self._min_is_scalar:
+                self._min_scalar = float(arr.flat[0])
+                self.clip_min_vector = None
+                self._min_tensor = tf.constant(self._min_scalar, dtype=tf.float32)
+            else:
+                self._min_scalar = None
+                self.clip_min_vector = arr
+                self._min_tensor = tf.constant(self.clip_min_vector, dtype=tf.float32)
+        else:
+            self._min_is_scalar = None
+            self._min_scalar = None
+            self.clip_min_vector = None
+            self._min_tensor = None
+
+        if self._has_max:
+            arr = np.asarray(clip_max, dtype=np.float32)
+            self._max_is_scalar = arr.ndim == 0 or (arr.ndim == 1 and arr.size == 1)
+            if self._max_is_scalar:
+                self._max_scalar = float(arr.flat[0])
+                self.clip_max_vector = None
+                self._max_tensor = tf.constant(self._max_scalar, dtype=tf.float32)
+            else:
+                self._max_scalar = None
+                self.clip_max_vector = arr
+                self._max_tensor = tf.constant(self.clip_max_vector, dtype=tf.float32)
+        else:
+            self._max_is_scalar = None
+            self._max_scalar = None
+            self.clip_max_vector = None
+            self._max_tensor = None
+
+        min_t = self._min_tensor
+        max_t = self._max_tensor
+        has_min = self._has_min
+        has_max = self._has_max
+
+        def clip_fn(x):
+            result = x
+            if has_min:
+                result = tf.maximum(result, min_t)
+            if has_max:
+                result = tf.minimum(result, max_t)
+            return result
+
+        self.keras_layer = layers.Lambda(clip_fn, name=name)
+
+    def __call__(self, inputs):
+        if not isinstance(inputs, list):
+            inputs = [inputs]
+        if len(inputs) != 1:
+            raise ValueError("ClipVectorized expects exactly one input.")
+        output_tensor = self.keras_layer(inputs[0].tensor)
+        return DataBuffer(output_tensor, op=self, inputs=inputs)
+
+    def compile_instructions(self, input_indices, weights_visited, model_structure):
+        if len(input_indices) != 1:
+            raise ValueError("ClipVectorized expects exactly one input.")
+
+        pw = weights_visited["parameters"]
+
+        if self.in_place:
+            target_index = input_indices[0]
+        else:
+            target_index = len(model_structure["buffer_sizes"])
+            model_structure["buffer_sizes"].append(
+                model_structure["buffer_sizes"][input_indices[0]]
+            )
+            copy_instr = {
+                "type": "COPY",
+                "input": input_indices[0],
+                "output": target_index,
+                "internal_index": 0,
+            }
+            model_structure["instructions"].append(copy_instr)
+
+        if id(self) not in pw:
+            indices = {}
+            if self._has_min:
+                indices["min"] = len(model_structure["parameters"])
+                if self._min_is_scalar:
+                    buffer_size = model_structure["buffer_sizes"][input_indices[0]]
+                    model_structure["parameters"].append([self._min_scalar] * buffer_size)
+                else:
+                    model_structure["parameters"].append(self.clip_min_vector.tolist())
+            if self._has_max:
+                indices["max"] = len(model_structure["parameters"])
+                if self._max_is_scalar:
+                    buffer_size = model_structure["buffer_sizes"][input_indices[0]]
+                    model_structure["parameters"].append([self._max_scalar] * buffer_size)
+                else:
+                    model_structure["parameters"].append(self.clip_max_vector.tolist())
+            pw[id(self)] = indices
+
+        cached = pw[id(self)]
+        instr = {
+            "type": "CLIP_ELEMENTWISE",
+            "input": target_index,
+        }
+        if "min" in cached:
+            instr["parameters_min"] = cached["min"]
+        if "max" in cached:
+            instr["parameters_max"] = cached["max"]
+
+        model_structure["instructions"].append(instr)
+        return target_index
+
+
 class Attention(ComputationOp):
     """
     An attention operation that computes softmax attention from a key buffer and applies it

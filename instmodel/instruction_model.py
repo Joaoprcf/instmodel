@@ -326,6 +326,14 @@ def instruction_model_inference(model, input_data):
             param = parameters[instruction["parameters"]]
             buffers[input_index] = input_data_buffer * param
 
+        elif instruction["type"] == "CLIP_ELEMENTWISE":
+            result = input_data_buffer
+            if "parameters_min" in instruction:
+                result = np.maximum(result, parameters[instruction["parameters_min"]])
+            if "parameters_max" in instruction:
+                result = np.minimum(result, parameters[instruction["parameters_max"]])
+            buffers[input_index] = result
+
         # Ensure the source buffer (still unassigned to an output) is float32.
         buffers[input_index] = np.array(buffers[input_index], dtype=np.float32)
 
@@ -382,6 +390,10 @@ def concatenate_instruction_models(models, start_from_first=False):
                 new_instruction["weights"] += w_offset
             if "parameters" in new_instruction:
                 new_instruction["parameters"] += p_offset
+            if "parameters_min" in new_instruction:
+                new_instruction["parameters_min"] += p_offset
+            if "parameters_max" in new_instruction:
+                new_instruction["parameters_max"] += p_offset
             if "map" in new_instruction:
                 new_instruction["map"] += m_offset
             if "input" in new_instruction:

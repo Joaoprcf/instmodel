@@ -897,6 +897,120 @@ class ShiftVectorized(ComputationOp):
         return target_index
 
 
+class ClipVectorized(ComputationOp):
+    def __init__(self, clip_min=None, clip_max=None, in_place=False, name=None):
+        super().__init__()
+        if clip_min is None and clip_max is None:
+            raise ValueError("ClipVectorized requires at least one of clip_min or clip_max.")
+
+        self.in_place = in_place
+        self.name = name
+        self._has_min = clip_min is not None
+        self._has_max = clip_max is not None
+
+        if self._has_min:
+            arr = np.asarray(clip_min, dtype=np.float32)
+            self._min_is_scalar = arr.ndim == 0 or (arr.ndim == 1 and arr.size == 1)
+            if self._min_is_scalar:
+                self._min_scalar = float(arr.flat[0])
+                self.clip_min_vector = None
+            else:
+                self._min_scalar = None
+                self.clip_min_vector = arr
+        else:
+            self._min_is_scalar = None
+            self._min_scalar = None
+            self.clip_min_vector = None
+
+        if self._has_max:
+            arr = np.asarray(clip_max, dtype=np.float32)
+            self._max_is_scalar = arr.ndim == 0 or (arr.ndim == 1 and arr.size == 1)
+            if self._max_is_scalar:
+                self._max_scalar = float(arr.flat[0])
+                self.clip_max_vector = None
+            else:
+                self._max_scalar = None
+                self.clip_max_vector = arr
+        else:
+            self._max_is_scalar = None
+            self._max_scalar = None
+            self.clip_max_vector = None
+
+    def __call__(self, inputs):
+        if not isinstance(inputs, list):
+            inputs = [inputs]
+        if len(inputs) != 1:
+            raise ValueError("ClipVectorized expects exactly one input.")
+        return DataBuffer(inputs[0]._shape, op=self, inputs=inputs)
+
+    def forward_op(self, x: torch.Tensor) -> torch.Tensor:
+        if self._has_min:
+            if self._min_is_scalar:
+                x = torch.clamp(x, min=self._min_scalar)
+            else:
+                t_min = torch.tensor(self.clip_min_vector, dtype=x.dtype, device=x.device)
+                x = torch.maximum(x, t_min)
+        if self._has_max:
+            if self._max_is_scalar:
+                x = torch.clamp(x, max=self._max_scalar)
+            else:
+                t_max = torch.tensor(self.clip_max_vector, dtype=x.dtype, device=x.device)
+                x = torch.minimum(x, t_max)
+        return x
+
+    def compile_instructions(self, input_indices, weights_visited, model_structure):
+        if len(input_indices) != 1:
+            raise ValueError("ClipVectorized expects exactly one input.")
+
+        pw = weights_visited["parameters"]
+
+        if self.in_place:
+            target_index = input_indices[0]
+        else:
+            target_index = len(model_structure["buffer_sizes"])
+            model_structure["buffer_sizes"].append(
+                model_structure["buffer_sizes"][input_indices[0]]
+            )
+            copy_instr = {
+                "type": "COPY",
+                "input": input_indices[0],
+                "output": target_index,
+                "internal_index": 0,
+            }
+            model_structure["instructions"].append(copy_instr)
+
+        if id(self) not in pw:
+            indices = {}
+            if self._has_min:
+                indices["min"] = len(model_structure["parameters"])
+                if self._min_is_scalar:
+                    buffer_size = model_structure["buffer_sizes"][input_indices[0]]
+                    model_structure["parameters"].append([self._min_scalar] * buffer_size)
+                else:
+                    model_structure["parameters"].append(self.clip_min_vector.tolist())
+            if self._has_max:
+                indices["max"] = len(model_structure["parameters"])
+                if self._max_is_scalar:
+                    buffer_size = model_structure["buffer_sizes"][input_indices[0]]
+                    model_structure["parameters"].append([self._max_scalar] * buffer_size)
+                else:
+                    model_structure["parameters"].append(self.clip_max_vector.tolist())
+            pw[id(self)] = indices
+
+        cached = pw[id(self)]
+        instr = {
+            "type": "CLIP_ELEMENTWISE",
+            "input": target_index,
+        }
+        if "min" in cached:
+            instr["parameters_min"] = cached["min"]
+        if "max" in cached:
+            instr["parameters_max"] = cached["max"]
+
+        model_structure["instructions"].append(instr)
+        return target_index
+
+
 class Attention(ComputationOp):
     def __init__(self, name=None):
         super().__init__()

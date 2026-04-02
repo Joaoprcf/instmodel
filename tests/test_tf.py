@@ -1,6 +1,7 @@
 from instmodel.tf import (
     ActivationComputation,
     Attention,
+    ClipVectorized,
     Concatenate,
     Dense,
     InputBuffer,
@@ -1040,3 +1041,176 @@ def test_sign_activation():
     assert np.array_equal(np.maximum(0, result_tf), step_expected), (
         "RELU(SIGN(x)) should produce step function"
     )
+
+
+def test_clip_vectorized_both_bounds():
+    """Tests Clip with both lower and upper vector bounds (in-place)."""
+    input_buffer = InputBuffer(3)
+    clipped = ClipVectorized(
+        clip_min=[0.0, -1.0, 0.5],
+        clip_max=[1.0, 2.0, 3.0],
+        in_place=True,
+    )(input_buffer)
+
+    model = ModelGraph(input_buffer, clipped)
+    result = model.create_instruction_model()
+
+    assert len(result["parameters"]) == 2
+    assert result["parameters"][0] == [0.0, -1.0, 0.5]
+    assert result["parameters"][1] == [1.0, 2.0, 3.0]
+
+    del result["weights"], result["bias"], result["maps"], result["parameters"]
+    assert result == {
+        "features": [],
+        "buffer_sizes": [3],
+        "instructions": [
+            {"type": "CLIP_ELEMENTWISE", "input": 0, "parameters_min": 0, "parameters_max": 1},
+        ],
+    }
+
+    x_data = np.array([[-2.0, 5.0, 1.0], [0.5, -3.0, 4.0]])
+    keras_pred = model.predict(x_data, verbose=0)
+    expected = np.clip(x_data, [0.0, -1.0, 0.5], [1.0, 2.0, 3.0])
+    assert np.allclose(keras_pred, expected, atol=1e-6)
+
+    inst_model = model.create_instruction_model()
+    inst_model["validation_data"] = {
+        "inputs": x_data.tolist(),
+        "expected_outputs": keras_pred.tolist(),
+    }
+    validate_instruction_model(inst_model)
+
+
+def test_clip_vectorized_lower_only():
+    """Tests Clip with only a lower bound."""
+    input_buffer = InputBuffer(2)
+    clipped = ClipVectorized(clip_min=[0.0, -1.0], in_place=True)(input_buffer)
+
+    model = ModelGraph(input_buffer, clipped)
+    result = model.create_instruction_model()
+
+    assert len(result["parameters"]) == 1
+    del result["weights"], result["bias"], result["maps"], result["parameters"]
+    assert result == {
+        "features": [],
+        "buffer_sizes": [2],
+        "instructions": [
+            {"type": "CLIP_ELEMENTWISE", "input": 0, "parameters_min": 0},
+        ],
+    }
+
+    x_data = np.array([[-5.0, 0.0], [3.0, -2.0]])
+    keras_pred = model.predict(x_data, verbose=0)
+    expected = np.maximum(x_data, [0.0, -1.0])
+    assert np.allclose(keras_pred, expected, atol=1e-6)
+
+    inst_model = model.create_instruction_model()
+    inst_model["validation_data"] = {
+        "inputs": x_data.tolist(),
+        "expected_outputs": keras_pred.tolist(),
+    }
+    validate_instruction_model(inst_model)
+
+
+def test_clip_vectorized_upper_only():
+    """Tests Clip with only an upper bound."""
+    input_buffer = InputBuffer(2)
+    clipped = ClipVectorized(clip_max=[1.0, 2.0], in_place=True)(input_buffer)
+
+    model = ModelGraph(input_buffer, clipped)
+    result = model.create_instruction_model()
+
+    assert len(result["parameters"]) == 1
+    del result["weights"], result["bias"], result["maps"], result["parameters"]
+    assert result == {
+        "features": [],
+        "buffer_sizes": [2],
+        "instructions": [
+            {"type": "CLIP_ELEMENTWISE", "input": 0, "parameters_max": 0},
+        ],
+    }
+
+    x_data = np.array([[5.0, 0.0], [-3.0, 3.0]])
+    keras_pred = model.predict(x_data, verbose=0)
+    expected = np.minimum(x_data, [1.0, 2.0])
+    assert np.allclose(keras_pred, expected, atol=1e-6)
+
+    inst_model = model.create_instruction_model()
+    inst_model["validation_data"] = {
+        "inputs": x_data.tolist(),
+        "expected_outputs": keras_pred.tolist(),
+    }
+    validate_instruction_model(inst_model)
+
+
+def test_clip_vectorized_scalar():
+    """Tests Clip with scalar bounds broadcast to all elements."""
+    input_buffer = InputBuffer(4)
+    clipped = ClipVectorized(clip_min=0.0, clip_max=1.0, in_place=True)(input_buffer)
+
+    model = ModelGraph(input_buffer, clipped)
+    result = model.create_instruction_model()
+
+    assert result["parameters"][0] == [0.0, 0.0, 0.0, 0.0]
+    assert result["parameters"][1] == [1.0, 1.0, 1.0, 1.0]
+
+    x_data = np.array([[-1.0, 0.5, 1.5, 0.0], [2.0, -0.5, 0.3, 0.8]])
+    keras_pred = model.predict(x_data, verbose=0)
+    expected = np.clip(x_data, 0.0, 1.0)
+    assert np.allclose(keras_pred, expected, atol=1e-6)
+
+    inst_model = model.create_instruction_model()
+    inst_model["validation_data"] = {
+        "inputs": x_data.tolist(),
+        "expected_outputs": keras_pred.tolist(),
+    }
+    validate_instruction_model(inst_model)
+
+
+def test_clip_vectorized_not_inplace():
+    """Tests Clip with in_place=False creates a COPY + new buffer."""
+    input_buffer = InputBuffer(2)
+    clipped = ClipVectorized(clip_min=0.0, clip_max=1.0, in_place=False)(input_buffer)
+
+    model = ModelGraph(input_buffer, clipped)
+    result = model.create_instruction_model()
+
+    del result["weights"], result["bias"], result["maps"], result["parameters"]
+    assert result == {
+        "features": [],
+        "buffer_sizes": [2, 2],
+        "instructions": [
+            {"type": "COPY", "input": 0, "output": 1, "internal_index": 0},
+            {"type": "CLIP_ELEMENTWISE", "input": 1, "parameters_min": 0, "parameters_max": 1},
+        ],
+    }
+
+
+def test_clip_vectorized_no_bounds_raises():
+    """Tests that Clip raises ValueError when neither bound is provided."""
+    import pytest
+    with pytest.raises(ValueError, match="at least one"):
+        ClipVectorized()
+
+
+def test_clip_vectorized_in_pipeline():
+    """Tests Clip works end-to-end in a model with Dense layers."""
+    input_buffer = InputBuffer(4)
+    hidden = Dense(8, activation="relu", name="h1")(input_buffer)
+    clipped = ClipVectorized(clip_min=0.0, clip_max=5.0, in_place=True)(hidden)
+    output = Dense(1, activation="sigmoid", name="out")(clipped)
+
+    model = ModelGraph(input_buffer, output)
+    model.compile(optimizer="adam", loss="binary_crossentropy")
+
+    x_data = np.random.random((10, 4)).astype(np.float32)
+    y_data = np.random.randint(0, 2, size=(10, 1)).astype(np.float32)
+    model.fit(x_data, y_data, epochs=1, verbose=0)
+
+    keras_pred = model.predict(x_data, verbose=0)
+    inst_model = model.create_instruction_model()
+    inst_model["validation_data"] = {
+        "inputs": x_data.tolist(),
+        "expected_outputs": keras_pred.tolist(),
+    }
+    validate_instruction_model(inst_model)
