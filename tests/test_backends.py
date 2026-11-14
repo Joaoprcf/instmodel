@@ -27,6 +27,7 @@ def roundtrip(model, x, features=None):
     im = model.create_instruction_model(features)
     im["validation_data"] = {"inputs": np.asarray(x).tolist(), "expected_outputs": pred.tolist()}
     validate_instruction_model(im)
+    json.dumps(im)
     return im, pred
 
 

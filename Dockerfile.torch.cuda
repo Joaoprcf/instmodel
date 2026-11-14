@@ -1,9 +1,10 @@
+# PyTorch tests on CUDA 13 GPUs: docker build -f Dockerfile.torch.cuda -t instmodel-cuda . && docker run --gpus all instmodel-cuda
 FROM nvidia/cuda:13.1.0-runtime-ubuntu24.04
 
-WORKDIR /workspace
+WORKDIR /app
 
 RUN apt-get update && \
-    apt-get install -y python3 python3-pip python3-venv build-essential && \
+    apt-get install -y python3 python3-pip python3-venv && \
     rm -rf /var/lib/apt/lists/*
 
 RUN python3 -m venv /opt/venv
@@ -11,11 +12,12 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 RUN pip install --upgrade pip && \
     pip install torch --index-url https://download.pytorch.org/whl/cu130 && \
-    pip install numpy pandas scipy scikit-learn
+    pip install numpy pandas scipy pytest
 
-COPY instmodel /workspace/instmodel
-COPY MANIFEST.in setup.py setup.cfg /workspace/
-
+COPY pyproject.toml README.md LICENSE /app/
+COPY instmodel /app/instmodel
 RUN pip install --no-deps .
 
-CMD ["bash"]
+COPY tests/ tests/
+
+CMD ["pytest", "tests", "-v"]
