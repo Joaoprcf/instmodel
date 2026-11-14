@@ -1,148 +1,152 @@
+import json
+import operator
+import os
+
 import numpy as np
 from scipy.special import erf
-import json
-import os
-import pandas as pd
 
 
 def load_model_from_label(model_location):
-    if os.path.exists(model_location):
-        with open(model_location, "r") as f:
-            model_json = json.load(f)
-    else:
+    if not os.path.exists(model_location):
         raise ValueError(f"Model not found at {model_location}")
-    return model_json
+    with open(model_location, "r") as f:
+        return json.load(f)
 
 
 def generate_features(model_label, dataset, output_features):
     model_json = load_model_from_label(model_label)
-
-    return generate_features_IO(
-        model_label, dataset, model_json["features"], output_features
-    )
+    return generate_features_IO(model_label, dataset, model_json["features"], output_features)
 
 
 def generate_features_IO(model_label, dataset, input_features, output_features):
-    # before going to s3, check if the model is already in the local cache in folder models
-
+    """Returns a copy of the DataFrame with output_features set to the model's outputs."""
     model_json = load_model_from_label(model_label)
-
-    *_, output = instruction_model_inference(
-        model_json, dataset[input_features].to_numpy()
-    )
-
+    *_, output = instruction_model_inference(model_json, dataset[input_features].to_numpy())
     dataset_new = dataset.copy()
     dataset_new[output_features] = output
-
     return dataset_new
 
 
-def apply_activation(instruction, buffers, output_index):
-    """
-    Applies the activation function specified in the instruction to the buffer at output_index.
+def _softmax(x):
+    axis = 0 if x.ndim == 1 else 1
+    exp_x = np.exp(x - np.max(x, axis=axis, keepdims=True))
+    return exp_x / np.sum(exp_x, axis=axis, keepdims=True)
 
-    Parameters:
-        instruction (dict): A dictionary that may contain an "activation" key.
-        buffers (dict or list): A container of NumPy arrays.
-        output_index: The key or index for the output buffer within `buffers`.
-    """
+
+def _log_positive(x, log):
+    result = np.zeros_like(x)
+    mask = x > 0
+    result[mask] = log(x[mask] + 1)
+    return result
+
+
+# Same switch points as TensorFlow's float32 softplus: log(eps) + 2.
+_SOFTPLUS_THRESHOLD = np.float32(np.log(np.finfo(np.float32).eps) + 2)
+
+_ACTIVATIONS = {
+    "RELU": lambda x: np.maximum(0, x),
+    "SIGMOID": lambda x: np.where(x >= 0, 1 / (1 + np.exp(-x)), np.exp(x) / (1 + np.exp(x))),
+    "SOFTMAX": _softmax,
+    "TANH": np.tanh,
+    "SQRT": lambda x: np.where(x > 0, np.sqrt(x), 0),
+    "LOG": lambda x: _log_positive(x, np.log),
+    "LOG10": lambda x: _log_positive(x, np.log10),
+    "INVERSE": lambda x: 1 - x,
+    "GELU": lambda x: x * 0.5 * (1 + erf(x / np.sqrt(2))),
+    "SOFTPLUS": lambda x: np.where(
+        x > -_SOFTPLUS_THRESHOLD,
+        x,
+        np.where(x < _SOFTPLUS_THRESHOLD, np.exp(x), np.log1p(np.exp(x))),
+    ),
+    "EXP": lambda x: np.exp(np.clip(x, -88, 88)),  # stays finite in float32
+    "SIGN": np.sign,
+}
+
+
+def apply_activation(instruction, buffers, output_index):
+    """Applies instruction["activation"] (if any) in place to buffers[output_index]."""
     act = instruction.get("activation")
     if act is None:
-        # No activation specified
         return
-
-    x = buffers[output_index]
-
-    if act == "RELU":
-        buffers[output_index] = np.maximum(0, x)
-
-    elif act == "SIGMOID":
-        # Using a numerically stable sigmoid computation
-        buffers[output_index] = np.where(
-            x >= 0, 1 / (1 + np.exp(-x)), np.exp(x) / (1 + np.exp(x))
-        )
-
-    elif act == "SOFTMAX":
-        # Determine axis based on array dimensions
-        if x.ndim == 1:
-            # For a 1D vector, subtract the max for numerical stability
-            shifted_x = x - np.max(x)
-            exp_x = np.exp(shifted_x)
-            buffers[output_index] = exp_x / np.sum(exp_x)
-        else:
-            # For 2D (or higher) arrays, assume softmax is computed along axis=1
-            shifted_x = x - np.max(x, axis=1, keepdims=True)
-            exp_x = np.exp(shifted_x)
-            buffers[output_index] = exp_x / np.sum(exp_x, axis=1, keepdims=True)
-
-    elif act == "TANH":
-        buffers[output_index] = np.tanh(x)
-
-    elif act == "SQRT":
-        # Compute sqrt(x) for x > 0, else 0
-        buffers[output_index] = np.where(x > 0, np.sqrt(x), 0)
-
-    elif act == "LOG":
-        # Compute log(x+1) for x > 0, else 0
-        result = np.zeros_like(x)
-        mask = x > 0
-        result[mask] = np.log(x[mask] + 1)
-        buffers[output_index] = result
-
-    elif act == "LOG10":
-        # Compute log10(x+1) for x > 0, else 0
-        result = np.zeros_like(x)
-        mask = x > 0
-        result[mask] = np.log10(x[mask] + 1)
-        buffers[output_index] = result
-
-    elif act == "INVERSE":
-        # Compute 1 - x
-        buffers[output_index] = 1 - x
-
-    elif act == "GELU":
-        # GeLU using the exact erf formulation (matches TensorFlow default)
-        # GeLU(x) = x * 0.5 * (1 + erf(x / sqrt(2)))
-        buffers[output_index] = x * 0.5 * (1 + erf(x / np.sqrt(2)))
-
-    elif act == "SOFTPLUS":
-        # Match TensorFlow's Eigen implementation structure:
-        # threshold = log(eps) + 2 ≈ -13.94 for float32
-        # x > -threshold: return x (softplus ≈ x for large positive)
-        # x < threshold: return exp(x) (softplus ≈ exp(x) for large negative)
-        # otherwise: return log1p(exp(x))
-        threshold = np.float32(np.log(np.finfo(np.float32).eps) + 2)
-        result = np.where(
-            x > -threshold,
-            x,
-            np.where(x < threshold, np.exp(x), np.log1p(np.exp(x)))
-        )
-        buffers[output_index] = result
-
-    elif act == "EXP":
-        # Clamp to [-88, 88] to avoid float32 overflow/underflow
-        buffers[output_index] = np.exp(np.clip(x, -88, 88))
-
-    elif act == "SIGN":
-        # sign(x): -1 for x < 0, 0 for x == 0, 1 for x > 0
-        buffers[output_index] = np.sign(x)
-
-    else:
+    fn = _ACTIVATIONS.get(act)
+    if fn is None:
         raise ValueError(f"Unexpected activation: {act}")
+    buffers[output_index] = fn(buffers[output_index])
+
+
+def _check_index(value, count, what):
+    try:
+        index = operator.index(value)
+    except TypeError:
+        raise ValueError(f"{what} index must be an integer, got {value!r}") from None
+    if not 0 <= index < count:
+        raise ValueError(f"{what} index {index} out of range [0, {count})")
+    return index
+
+
+def _check_span(start, length, capacity, what):
+    start = _check_index(start, capacity + 1, f"{what} offset")
+    if start + length > capacity:
+        raise ValueError(f"{what} writes columns [{start}, {start + length}) past buffer size {capacity}")
+
+
+def _validate_references(model):
+    """Rejects out-of-range or negative references, which NumPy would otherwise wrap or misread."""
+    sizes = model["buffer_sizes"]
+    n_buffers = len(sizes)
+    counts = {
+        "weights": len(model["weights"]),
+        "parameters": len(model["parameters"]),
+        "parameters_min": len(model["parameters"]),
+        "parameters_max": len(model["parameters"]),
+        "map": len(model.get("maps", [])),
+    }
+    for instr in model["instructions"]:
+        inputs = instr.get("input")
+        for value in inputs if isinstance(inputs, list) else [inputs]:
+            _check_index(value, n_buffers, "buffer")
+        for key in ("output", "key"):
+            if key in instr:
+                _check_index(instr[key], n_buffers, "buffer")
+        for key, count in counts.items():
+            if key in instr:
+                _check_index(instr[key], count, key)
+        if instr["type"] == "COPY_MASKED":
+            if len(instr["indexes"]) > sizes[instr["output"]]:
+                raise ValueError("COPY_MASKED selects more columns than its output buffer holds")
+            for value in instr["indexes"]:
+                _check_index(value, sizes[instr["input"]], "COPY_MASKED column")
+        elif instr["type"] == "COPY":
+            _check_span(instr["internal_index"], sizes[instr["input"]], sizes[instr["output"]], "COPY")
+        elif instr["type"] == "MAP_TRANSFORM":
+            _check_index(instr["internal_input_index"], sizes[instr["input"]], "MAP_TRANSFORM column")
+            _check_span(
+                instr["internal_output_index"], instr["size"], sizes[instr["output"]], "MAP_TRANSFORM"
+            )
+
+
+def _output_buffer(buffers, buffer_sizes, index, rows):
+    if buffers[index] is None:
+        buffers[index] = np.zeros((rows, buffer_sizes[index]), dtype=np.float32)
+    return buffers[index]
+
+
+_BUFFER_REDUCERS = {"ADD_ELEMENTWISE_BUFFERS": np.sum, "MULTIPLY_ELEMENTWISE_BUFFERS": np.prod}
+_HEAD_COMBINERS = {"ADD_BUFFER_HEADS": np.add, "MULTIPLY_BUFFER_HEADS": np.multiply}
 
 
 def instruction_model_inference(model, input_data):
-    import numpy as np
+    """Runs the model on a 2D array (split across the leading buffers) or a list of per-buffer arrays.
 
-    # Convert weights, bias, and parameters into float32 numpy arrays.
+    Returns every buffer; the last one is the model output.
+    """
+    _validate_references(model)
     weights = [np.array(w, dtype=np.float32) for w in model["weights"]]
     bias = [np.array(b, dtype=np.float32) for b in model["bias"]]
     parameters = [np.array(p, dtype=np.float32) for p in model["parameters"]]
     buffer_sizes = model["buffer_sizes"]
-    instructions = model["instructions"]
     buffers = [None] * len(buffer_sizes)
 
-    # Initialize the first buffers from input_data (can be a list or a single array).
     if isinstance(input_data, list):
         for i, data in enumerate(input_data):
             buffers[i] = data.copy()
@@ -151,226 +155,120 @@ def instruction_model_inference(model, input_data):
                     f"Input data shape does not match the expected shape. Expected {buffer_sizes[i]} but got {buffers[i].shape[1]}"
                 )
     else:
-        # When input_data is a single numpy array, we need to partition it into the correct initial buffers.
         total_features = input_data.shape[1]
-        accumulated = 0
         accumulated_capacities = []
-        num_buffers = 0
-        valid = False
-
-        # Validate that the input feature size can be exactly partitioned into one or more buffers.
+        accumulated = 0
         for size in buffer_sizes:
             accumulated += size
             accumulated_capacities.append(accumulated)
-            num_buffers += 1
-            if accumulated == total_features:
-                valid = True
+            if accumulated >= total_features:
                 break
-            elif accumulated > total_features:
-                break
-
-        if not valid:
+        if not accumulated_capacities or accumulated != total_features:
             raise ValueError(
                 f"Invalid input feature size: expected one of the cumulative capacities {accumulated_capacities} but got {total_features}"
             )
-
-        # Partition the input_data into the first 'num_buffers' buffers.
         start = 0
-        for i in range(num_buffers):
-            end = start + buffer_sizes[i]
-            buffers[i] = input_data[:, start:end].copy()
-            start = end
+        for i, size in enumerate(buffer_sizes[: len(accumulated_capacities)]):
+            buffers[i] = input_data[:, start : start + size].copy()
+            start += size
 
-    # Process each instruction.
-    for instruction in instructions:
-        if instruction["type"] == "ACTIVATION":
-            output_index = instruction["input"]
-            apply_activation(instruction, buffers, output_index)
+    for instruction in model["instructions"]:
+        kind = instruction["type"]
+        src = instruction["input"]
+        if kind == "ACTIVATION":
+            apply_activation(instruction, buffers, src)
             continue
-        # --- New instructions that expect a list of input indices ---
-        elif instruction["type"] == "ADD_ELEMENTWISE_BUFFERS":
-            # "input" is a list of buffer indices
-            input_indices = instruction["input"]
-            # Get each buffer and stack along a new axis (assumes all buffers have equal shape)
-            stacked = np.stack([buffers[i] for i in input_indices], axis=0)
-            result = np.sum(stacked, axis=0)
-            output_index = instruction["output"]
-            # Compute elementwise addition across the stacked buffers    # This ensures "deploy" only runs on valid version tags in the form release-x.x.x
-            buffers[output_index] = np.array(result, dtype=np.float32)
+        if kind in _BUFFER_REDUCERS:
+            stacked = np.stack([buffers[i] for i in src], axis=0)
+            buffers[instruction["output"]] = np.asarray(
+                _BUFFER_REDUCERS[kind](stacked, axis=0), dtype=np.float32
+            )
             continue
-
-        elif instruction["type"] == "MULTIPLY_ELEMENTWISE_BUFFERS":
-            # "input" is a list of buffer indices
-            input_indices = instruction["input"]
-            stacked = np.stack([buffers[i] for i in input_indices], axis=0)
-            # Compute elementwise multiplication across the stacked buffers.
-            result = np.prod(stacked, axis=0)
-            output_index = instruction["output"]
-            buffers[output_index] = np.array(result, dtype=np.float32)
+        if kind in _HEAD_COMBINERS:
+            data, heads = buffers[src[0]], buffers[src[1]]
+            expanded = np.repeat(heads, repeats=data.shape[1] // heads.shape[1], axis=1)
+            buffers[instruction["output"]] = np.asarray(
+                _HEAD_COMBINERS[kind](data, expanded), dtype=np.float32
+            )
+            continue
+        if kind == "REDUCE_SUM":
+            buffers[instruction["output"]] = np.asarray(
+                np.sum(buffers[src], axis=-1, keepdims=True), dtype=np.float32
+            )
             continue
 
-        elif instruction["type"] == "MULTIPLY_BUFFER_HEADS":
-            data_idx, heads_idx = instruction["input"]
-            output_index = instruction["output"]
-            data_buf = buffers[data_idx]
-            heads_buf = buffers[heads_idx]
-            data_size = data_buf.shape[1]
-            heads_size = heads_buf.shape[1]
-            head_dim = data_size // heads_size
-            expanded = np.repeat(heads_buf, repeats=head_dim, axis=1)
-            buffers[output_index] = np.array(data_buf * expanded, dtype=np.float32)
-            continue
-
-        elif instruction["type"] == "ADD_BUFFER_HEADS":
-            data_idx, heads_idx = instruction["input"]
-            output_index = instruction["output"]
-            data_buf = buffers[data_idx]
-            heads_buf = buffers[heads_idx]
-            data_size = data_buf.shape[1]
-            heads_size = heads_buf.shape[1]
-            head_dim = data_size // heads_size
-            expanded = np.repeat(heads_buf, repeats=head_dim, axis=1)
-            buffers[output_index] = np.array(data_buf + expanded, dtype=np.float32)
-            continue
-
-        elif instruction["type"] == "REDUCE_SUM":
-            input_index = instruction["input"]
-            output_index = instruction["output"]
-            result = np.sum(buffers[input_index], axis=-1, keepdims=True)
-            buffers[output_index] = np.array(result, dtype=np.float32)
-            continue
-
-        # --- Existing instructions (where "input" is a single index) --
-        # In these cases we assume "input" is an integer.
-        input_index = instruction["input"]
-        # Get the buffer corresponding to the single input for this instruction.
-        input_data_buffer = buffers[input_index]
-
-        if instruction["type"] == "COPY_MASKED":
-            output_index = instruction["output"]
+        x = buffers[src]
+        if kind == "COPY_MASKED":
             indexes = instruction["indexes"]
-            if buffers[output_index] is None:
-                buffers[output_index] = np.zeros(
-                    (input_data_buffer.shape[0], buffer_sizes[output_index]),
-                    dtype=np.float32,
-                )
-            # Copy only the selected indices.
-            buffers[output_index][:, list(range(len(indexes)))] = input_data_buffer[
-                :, indexes
-            ]
-
-        elif instruction["type"] == "COPY":
-            output_index = instruction["output"]
-            internal_index = instruction["internal_index"]
-            size = buffer_sizes[input_index]
-            if buffers[output_index] is None:
-                buffers[output_index] = np.zeros(
-                    (input_data_buffer.shape[0], buffer_sizes[output_index]),
-                    dtype=np.float32,
-                )
-            buffers[output_index][:, internal_index : internal_index + size] = (
-                input_data_buffer[:, :]
-            )
-
-        elif instruction["type"] == "MAP_TRANSFORM":
-            output_index = instruction["output"]
-            internal_input_index = instruction["internal_input_index"]
-            internal_output_index = instruction["internal_output_index"]
-            map_index = instruction["map"]
-            default = instruction["default"]
+            out = _output_buffer(buffers, buffer_sizes, instruction["output"], x.shape[0])
+            out[:, : len(indexes)] = x[:, indexes]
+        elif kind == "COPY":
+            start = instruction["internal_index"]
+            out = _output_buffer(buffers, buffer_sizes, instruction["output"], x.shape[0])
+            out[:, start : start + buffer_sizes[src]] = x
+        elif kind == "MAP_TRANSFORM":
             size = instruction["size"]
-            map_data = {int(k): v for k, v in model["maps"][map_index].items()}
-
-            if buffers[output_index] is None:
-                buffers[output_index] = np.zeros(
-                    (input_data_buffer.shape[0], buffer_sizes[output_index]),
-                    dtype=np.float32,
-                )
-
-            buffers[output_index][
-                :, internal_output_index : internal_output_index + size
-            ] = np.array(
-                [
-                    np.array(map_data.get(i.item(), default))
-                    for i in input_data_buffer[
-                        :, internal_input_index : internal_input_index + 1
-                    ].flatten()
-                ]
+            default = instruction["default"]
+            map_data = {int(k): v for k, v in model["maps"][instruction["map"]].items()}
+            col = instruction["internal_input_index"]
+            start = instruction["internal_output_index"]
+            out = _output_buffer(buffers, buffer_sizes, instruction["output"], x.shape[0])
+            out[:, start : start + size] = np.array(
+                [np.array(map_data.get(i.item(), default)) for i in x[:, col]]
             ).reshape(-1, size)
-
-        elif instruction["type"] == "DOT":
-            w_index = instruction["weights"]
-            output_index = instruction["output"]
-            buffers[output_index] = (
-                input_data_buffer @ weights[w_index].T + bias[w_index]
-            )
-            apply_activation(instruction, buffers, output_index)
-
-        elif instruction["type"] == "ATTENTION":
-            w_index = instruction["weights"]
-            output_index = instruction["output"]
-            key_index = instruction["key"]
-            key_data = buffers[key_index]
-            buffers[output_index] = key_data @ weights[w_index].T + bias[w_index]
-            x = buffers[output_index]
-            x = x - np.max(x, axis=1, keepdims=True)
-            exp_x = np.exp(x)
-            buffers[output_index] = exp_x / np.sum(exp_x, axis=1, keepdims=True)
-            buffers[output_index] = buffers[output_index] * input_data_buffer
-
-        elif instruction["type"] == "ADD_ELEMENTWISE":
-            param = parameters[instruction["parameters"]]
-            buffers[input_index] = input_data_buffer + param
-
-        elif instruction["type"] == "MUL_ELEMENTWISE":
-            param = parameters[instruction["parameters"]]
-            buffers[input_index] = input_data_buffer * param
-
-        elif instruction["type"] == "CLIP_ELEMENTWISE":
-            result = input_data_buffer
+        elif kind == "DOT":
+            w = instruction["weights"]
+            buffers[instruction["output"]] = x @ weights[w].T + bias[w]
+            apply_activation(instruction, buffers, instruction["output"])
+        elif kind == "ATTENTION":
+            w = instruction["weights"]
+            scores = buffers[instruction["key"]] @ weights[w].T + bias[w]
+            buffers[instruction["output"]] = _softmax(scores) * x
+        elif kind == "ADD_ELEMENTWISE":
+            buffers[src] = x + parameters[instruction["parameters"]]
+        elif kind == "MUL_ELEMENTWISE":
+            buffers[src] = x * parameters[instruction["parameters"]]
+        elif kind == "CLIP_ELEMENTWISE":
             if "parameters_min" in instruction:
-                result = np.maximum(result, parameters[instruction["parameters_min"]])
+                x = np.maximum(x, parameters[instruction["parameters_min"]])
             if "parameters_max" in instruction:
-                result = np.minimum(result, parameters[instruction["parameters_max"]])
-            buffers[input_index] = result
-
-        # Ensure the source buffer (still unassigned to an output) is float32.
-        buffers[input_index] = np.array(buffers[input_index], dtype=np.float32)
+                x = np.minimum(x, parameters[instruction["parameters_max"]])
+            buffers[src] = x
+        else:
+            raise ValueError(f"Unknown instruction type: {kind}")
+        buffers[src] = np.asarray(buffers[src], dtype=np.float32)
 
     return buffers
 
 
 def validate_instruction_model(model):
-    input_data_all = np.array(model["validation_data"]["inputs"])
-    output_data_all = np.array(model["validation_data"]["expected_outputs"])
-    buffers = instruction_model_inference(model, input_data_all)
-    output_inference = buffers[-1]
-    if not np.allclose(output_data_all, output_inference, atol=1e-6):
-        print("output_data_all shape:", output_data_all.shape)
-        print("output_inference shape:", output_inference.shape)
-        print("MAX ERROR: ", np.max(np.abs(output_data_all - output_inference)))
-        print("MEAN ERROR: ", np.mean(np.abs(output_data_all - output_inference)))
-        print("All ERROR: ", np.abs(output_data_all - output_inference))
-
-    assert np.allclose(output_data_all, output_inference, atol=1e-6)
+    """Raises AssertionError unless inference on validation_data matches expected_outputs (atol 1e-6)."""
+    expected = np.array(model["validation_data"]["expected_outputs"])
+    actual = instruction_model_inference(model, np.array(model["validation_data"]["inputs"]))[-1]
+    if not np.allclose(expected, actual, atol=1e-6):
+        print("output_data_all shape:", expected.shape)
+        print("output_inference shape:", actual.shape)
+        print("MAX ERROR: ", np.max(np.abs(expected - actual)))
+        print("MEAN ERROR: ", np.mean(np.abs(expected - actual)))
+        print("All ERROR: ", np.abs(expected - actual))
+        raise AssertionError("Instruction model output does not match validation_data.")
 
 
 def concatenate_instruction_models(models, start_from_first=False):
-    features = models[0]["features"]
-    # Start with the first model's buffer_sizes. (Assume at least one model.)
+    """Chains models: each model's first buffer is the previous model's last buffer."""
     concatenated_buffer_sizes = models[0]["buffer_sizes"][:]
     for model in models[1:]:
-        # Ensure that the last buffer in the previous model matches the first buffer of the next.
-        assert concatenated_buffer_sizes[-1] == model["buffer_sizes"][0]
+        if concatenated_buffer_sizes[-1] != model["buffer_sizes"][0]:
+            raise AssertionError("Last buffer of a model must match the first buffer of the next.")
         concatenated_buffer_sizes += model["buffer_sizes"][1:]
 
     if start_from_first:
         new_model = models[0]
-        current_buffer_offset = len(new_model["buffer_sizes"]) - 1
+        offset = len(new_model["buffer_sizes"]) - 1
         new_model["buffer_sizes"] = concatenated_buffer_sizes
     else:
         new_model = {
-            "features": features,
+            "features": models[0]["features"],
             "buffer_sizes": concatenated_buffer_sizes,
             "instructions": [],
             "weights": [],
@@ -378,58 +276,48 @@ def concatenate_instruction_models(models, start_from_first=False):
             "parameters": [],
             "maps": [],
         }
-        current_buffer_offset = 0
+        offset = 0
 
     for model in models[int(start_from_first) :]:
-        w_offset = len(new_model["weights"])
-        p_offset = len(new_model["parameters"])
-        m_offset = len(new_model["maps"])
+        shifts = {
+            "weights": len(new_model["weights"]),
+            "parameters": len(new_model["parameters"]),
+            "parameters_min": len(new_model["parameters"]),
+            "parameters_max": len(new_model["parameters"]),
+            "map": len(new_model["maps"]),
+            "output": offset,
+            "key": offset,
+        }
         for instruction in model["instructions"]:
             new_instruction = instruction.copy()
-            if "weights" in new_instruction:
-                new_instruction["weights"] += w_offset
-            if "parameters" in new_instruction:
-                new_instruction["parameters"] += p_offset
-            if "parameters_min" in new_instruction:
-                new_instruction["parameters_min"] += p_offset
-            if "parameters_max" in new_instruction:
-                new_instruction["parameters_max"] += p_offset
-            if "map" in new_instruction:
-                new_instruction["map"] += m_offset
+            for key, shift in shifts.items():
+                if key in new_instruction:
+                    new_instruction[key] += shift
             if "input" in new_instruction:
-                if isinstance(new_instruction["input"], list):
-                    new_instruction["input"] = [
-                        x + current_buffer_offset for x in new_instruction["input"]
-                    ]
-                else:
-                    new_instruction["input"] += current_buffer_offset
-            if "output" in new_instruction:
-                new_instruction["output"] += current_buffer_offset
-            if "key" in new_instruction:
-                new_instruction["key"] += current_buffer_offset
+                inputs = new_instruction["input"]
+                new_instruction["input"] = (
+                    [x + offset for x in inputs] if isinstance(inputs, list) else inputs + offset
+                )
             new_model["instructions"].append(new_instruction)
 
-        new_model["weights"] += model["weights"]
-        new_model["bias"] += model["bias"]
-        new_model["parameters"] += model["parameters"]
-        new_model["maps"] += model["maps"]
-
-        current_buffer_offset += len(model["buffer_sizes"]) - 1
+        for key in ("weights", "bias", "parameters", "maps"):
+            new_model[key] += model[key]
+        offset += len(model["buffer_sizes"]) - 1
     return new_model
 
 
 def create_instructions_model_from_transformation_list(features, transformation_list):
+    """Builds a feature-preprocessing model from {"delete": f} and {"from", "to", "map", "size", "default"} items.
+
+    Returns (instruction model, output feature names).
+    """
     new_size = (
         len(features)
         + sum(i["size"] for i in transformation_list if "to" in i)
         - sum(1 for i in transformation_list if "delete" in i)
     )
+    transformation_list = sorted(transformation_list, key=lambda x: "delete" in x, reverse=True)
 
-    transformation_list = sorted(
-        transformation_list, key=lambda x: "delete" in x, reverse=True
-    )
-
-    instructions = []
     new_features = features.copy()
     keep_indexes = [*range(len(features))]
     for transformation in transformation_list:
@@ -439,28 +327,17 @@ def create_instructions_model_from_transformation_list(features, transformation_
         elif "to" in transformation:
             new_features.extend(transformation["to"])
 
-    instructions.append(
-        {
-            "type": "COPY_MASKED",
-            "input": 0,
-            "output": 1,
-            "indexes": keep_indexes,
-        }
-    )
+    instructions = [{"type": "COPY_MASKED", "input": 0, "output": 1, "indexes": keep_indexes}]
     maps = []
     for transformation in transformation_list:
         if "to" in transformation:
-            from_idx = features.index(transformation["from"])
-
             instructions.append(
                 {
                     "type": "MAP_TRANSFORM",
                     "input": 0,
                     "output": 1,
-                    "internal_input_index": from_idx,
-                    "internal_output_index": new_features.index(
-                        transformation["to"][0]
-                    ),
+                    "internal_input_index": features.index(transformation["from"]),
+                    "internal_output_index": new_features.index(transformation["to"][0]),
                     "map": len(maps),
                     "size": transformation["size"],
                     "default": transformation["default"],
