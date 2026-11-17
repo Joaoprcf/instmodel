@@ -1,11 +1,22 @@
 import numpy as np
 import pytest
 
-torch = pytest.importorskip("torch")
+from instmodel import sequence
+from test_sequence import CONFIGS, randomized, tokens_for
 
-from instmodel import sequence  # noqa: E402
-from instmodel.sequence import torch as st  # noqa: E402
-from test_sequence import CONFIGS, randomized, tokens_for  # noqa: E402
+torch = st = None
+
+
+@pytest.fixture(scope="module", autouse=True)
+def backend():
+    """Imports the framework only when a test of this file runs.
+
+    Collecting this file must not load it: the two frameworks cannot share a
+    process on every installation, and ``-k`` deselects one backend's tests.
+    """
+    global torch, st
+    torch = pytest.importorskip("torch")
+    from instmodel.sequence import torch as st
 
 
 def config_of(name):
