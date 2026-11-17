@@ -19,7 +19,7 @@ dependencies = ["numpy", "pandas", "scipy"]
 
 [project.optional-dependencies]
 tensorflow = ["tensorflow>=2.20", "protobuf>=6.0"]
-pytorch = ["torch>=2.0"]
+pytorch = ["torch>=2.5"]
 
 [project.urls]
 Homepage = "https://github.com/Joaoprcf/instmodel"
