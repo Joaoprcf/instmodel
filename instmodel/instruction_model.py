@@ -99,7 +99,11 @@ def _validate_references(model):
         "parameters": len(model["parameters"]),
         "parameters_min": len(model["parameters"]),
         "parameters_max": len(model["parameters"]),
+        "gain": len(model["parameters"]),
+        "bias": len(model["parameters"]),
         "map": len(model.get("maps", [])),
+        "slot": len(model.get("sequence", {}).get("kv_slots", [])),
+        "scanner": model.get("sequence", {}).get("scanners", 0),
     }
     for instr in model["instructions"]:
         inputs = instr.get("input")
@@ -123,6 +127,48 @@ def _validate_references(model):
             _check_span(
                 instr["internal_output_index"], instr["size"], sizes[instr["output"]], "MAP_TRANSFORM"
             )
+        elif instr["type"] == "EMBEDDING":
+            _check_index(instr.get("internal_input_index", 0), sizes[instr["input"]], "EMBEDDING column")
+        elif instr["type"] == "SEGMENT_FEATURES":
+            if sizes[instr["output"]] != 2:
+                raise ValueError("SEGMENT_FEATURES writes an (ordinal, index) buffer of size 2")
+        elif instr["type"] == "CAUSAL_ATTENTION":
+            slot = model["sequence"]["kv_slots"][instr["slot"]]
+            heads, shared, head = instr["heads"], instr["kv_heads"], slot["head_dim"]
+            if (heads, shared) != (slot["heads"], slot["kv_heads"]) or shared < 1 or heads % shared:
+                raise ValueError("CAUSAL_ATTENTION heads differ from its key/value slot")
+            if sizes[instr["input"]] != (heads + 2 * shared) * head or sizes[instr["output"]] != heads * head:
+                raise ValueError("CAUSAL_ATTENTION buffers do not match its heads and head_dim")
+
+
+def _segment_features(instruction, tokens, scanner):
+    """Advances one feature scanner by a token per row and returns ``[ordinal, index]`` columns."""
+    member = np.isin(tokens, instruction["members"])
+    run = member | (np.isin(tokens, instruction["openers"]) & ~scanner["prev_member"])
+    start = run & ~scanner["prev_run"]
+    scanner["ordinal"] = scanner["ordinal"] + start
+    scanner["index"] = np.where(start, 1, np.where(run, scanner["index"] + 1, 0))
+    scanner["prev_member"], scanner["prev_run"] = member, run
+    limit = instruction["rows"] - 1
+    return np.minimum(np.stack((scanner["ordinal"], scanner["index"]), -1), limit).astype(np.float32)
+
+
+def _causal_attention(instruction, x, slot, position):
+    """Appends this token's keys and values to ``slot`` and attends over the cached prefix."""
+    heads, shared = instruction["heads"], instruction["kv_heads"]
+    head = x.shape[1] // (heads + 2 * shared)
+    rows = x.shape[0]
+    if position >= slot["keys"].shape[1]:
+        raise ValueError("sequence exceeds the model's max_positions")
+    query = x[:, : heads * head].reshape(rows, shared, heads // shared, head)
+    slot["keys"][:, position] = x[:, heads * head : (heads + shared) * head].reshape(rows, shared, head)
+    slot["values"][:, position] = x[:, (heads + shared) * head :].reshape(rows, shared, head)
+    keys, values = slot["keys"][:, : position + 1], slot["values"][:, : position + 1]
+    # Query head h reads key/value head h // (heads // kv_heads).
+    scores = np.einsum("rgqd,rtgd->rgqt", query, keys) * np.float32(head ** -0.5)
+    scores = np.exp(scores - scores.max(-1, keepdims=True))
+    scores = scores / scores.sum(-1, keepdims=True)
+    return np.einsum("rgqt,rtgd->rgqd", scores, values).reshape(rows, heads * head).astype(np.float32)
 
 
 def _output_buffer(buffers, buffer_sizes, index, rows):
@@ -135,15 +181,20 @@ _BUFFER_REDUCERS = {"ADD_ELEMENTWISE_BUFFERS": np.sum, "MULTIPLY_ELEMENTWISE_BUF
 _HEAD_COMBINERS = {"ADD_BUFFER_HEADS": np.add, "MULTIPLY_BUFFER_HEADS": np.multiply}
 
 
-def instruction_model_inference(model, input_data):
+def model_arrays(model):
+    """Validates references and returns the model's (weights, bias, parameters) as float32 arrays."""
+    _validate_references(model)
+    return tuple([np.array(v, dtype=np.float32) for v in model[key]] for key in ("weights", "bias", "parameters"))
+
+
+def instruction_model_inference(model, input_data, state=None, arrays=None):
     """Runs the model on a 2D array (split across the leading buffers) or a list of per-buffer arrays.
 
-    Returns every buffer; the last one is the model output.
+    Returns every buffer; the last one is the model output. ``state`` carries
+    the caches of the stateful instructions (see ``instmodel.sequence``), with
+    one row per sequence; ``arrays`` reuses the result of ``model_arrays``.
     """
-    _validate_references(model)
-    weights = [np.array(w, dtype=np.float32) for w in model["weights"]]
-    bias = [np.array(b, dtype=np.float32) for b in model["bias"]]
-    parameters = [np.array(p, dtype=np.float32) for p in model["parameters"]]
+    weights, bias, parameters = arrays if arrays is not None else model_arrays(model)
     buffer_sizes = model["buffer_sizes"]
     buffers = [None] * len(buffer_sizes)
 
@@ -195,6 +246,35 @@ def instruction_model_inference(model, input_data):
             buffers[instruction["output"]] = np.asarray(
                 np.sum(buffers[src], axis=-1, keepdims=True), dtype=np.float32
             )
+            continue
+        if kind == "EMBEDDING":
+            table = weights[instruction["weights"]]
+            ids = np.rint(buffers[src][:, instruction.get("internal_input_index", 0)]).astype(np.int64)
+            if ids.min() < 0 or ids.max() >= len(table):
+                raise ValueError(f"EMBEDDING id outside [0, {len(table)})")
+            buffers[instruction["output"]] = table[ids]
+            continue
+        if kind == "LAYER_NORM":
+            x = buffers[src]
+            centered = x - x.mean(-1, keepdims=True)
+            scale = np.sqrt((centered * centered).mean(-1, keepdims=True) + np.float32(instruction["epsilon"]))
+            buffers[instruction["output"]] = np.asarray(
+                centered / scale * parameters[instruction["gain"]] + parameters[instruction["bias"]],
+                dtype=np.float32,
+            )
+            continue
+        if kind in ("SEGMENT_FEATURES", "CAUSAL_ATTENTION"):
+            if state is None:
+                raise ValueError(f"{kind} needs sequence state; step the model with instmodel.sequence")
+            if kind == "SEGMENT_FEATURES":
+                tokens = np.rint(buffers[src][:, 0]).astype(np.int64)
+                buffers[instruction["output"]] = _segment_features(
+                    instruction, tokens, state["scanners"][instruction["scanner"]]
+                )
+            else:
+                buffers[instruction["output"]] = _causal_attention(
+                    instruction, buffers[src], state["kv"][instruction["slot"]], state["position"]
+                )
             continue
 
         x = buffers[src]
@@ -256,6 +336,8 @@ def validate_instruction_model(model):
 
 def concatenate_instruction_models(models, start_from_first=False):
     """Chains models: each model's first buffer is the previous model's last buffer."""
+    if any("sequence" in model for model in models):
+        raise ValueError("sequence models carry state and cannot be concatenated")
     concatenated_buffer_sizes = models[0]["buffer_sizes"][:]
     for model in models[1:]:
         if concatenated_buffer_sizes[-1] != model["buffer_sizes"][0]:
@@ -284,6 +366,8 @@ def concatenate_instruction_models(models, start_from_first=False):
             "parameters": len(new_model["parameters"]),
             "parameters_min": len(new_model["parameters"]),
             "parameters_max": len(new_model["parameters"]),
+            "gain": len(new_model["parameters"]),
+            "bias": len(new_model["parameters"]),
             "map": len(new_model["maps"]),
             "output": offset,
             "key": offset,

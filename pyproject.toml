@@ -25,4 +25,4 @@ pytorch = ["torch>=2.0"]
 Homepage = "https://github.com/Joaoprcf/instmodel"
 
 [tool.setuptools]
-packages = ["instmodel"]
+packages = ["instmodel", "instmodel.sequence"]
