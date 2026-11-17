@@ -42,6 +42,9 @@ def tf_backend(args, config):
 
     from instmodel.sequence import tf as backend
 
+    for gpu in tf.config.list_physical_devices("GPU"):
+        tf.config.experimental.set_memory_growth(gpu, True)
+
     device = "cuda" if tf.config.list_physical_devices("GPU") else "cpu"
     model = backend.Transformer(config, members=args.members)
     trainer = backend.Trainer(model, synthetic_rows(args), args.batch, 1e-3, compile=not args.no_xla)

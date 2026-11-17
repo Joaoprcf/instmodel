@@ -182,6 +182,22 @@ def test_training_learns_a_successor_rule():
     np.testing.assert_array_equal(np.stack(stepped, 1), generated.numpy())
 
 
+def test_several_steps_per_call_equal_single_steps():
+    config = config_of("grouped")
+    rng = np.random.default_rng(0)
+    data = dict(tokens=torch.as_tensor(rng.integers(0, 14, (32, 13))), groups=torch.as_tensor(rng.integers(-1, 2, (32, 12))))
+    finals = []
+    for calls in ((1, 1, 1), (3,)):
+        torch.manual_seed(0)
+        trainer = st.Trainer(st.Transformer(config, members=2, bf16=False), data, batch=4, lr=1e-2)
+        for steps in calls:
+            trainer.step(1e-2, steps)
+        assert float(trainer.optimizer.state[trainer.parameters[0]]["step"]) == 3
+        finals.append(trainer.model.member_parameters(1))
+    for key, value in finals[0].items():
+        np.testing.assert_allclose(finals[1][key], value, atol=1e-6, err_msg=key)
+
+
 def test_schedule_endpoints():
     assert st.schedule(0, 1.0) == 0
     assert st.schedule(0.03, 1.0) == pytest.approx(1.0)

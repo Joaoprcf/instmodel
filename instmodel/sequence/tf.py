@@ -2,8 +2,13 @@
 
 Mirrors ``instmodel.sequence.torch``. Every parameter is a variable of
 ``parameter_shapes`` with a leading members axis, so ``members`` models train
-side by side in the same kernels. One ``tf.function`` performs the whole step
-(sampling, loss, clipping, AdamW, EMA) without a host round trip.
+side by side in the same kernels. One XLA-compiled ``tf.function`` performs
+whole steps (sampling, loss, clipping, AdamW, EMA) on the device.
+
+TensorFlow reserves most of the GPU memory on first use. A process that shares
+the GPU with another framework or job should call
+``tf.config.experimental.set_memory_growth(gpu, True)`` before building a
+model; this module leaves that process-wide choice to the caller.
 """
 
 import math
@@ -14,6 +19,7 @@ import tensorflow as tf
 from ._spec import check_parameters, init_parameters
 
 SOFT = ("soft_positions", "soft_tokens", "soft_shares")
+ALIGN = 8  # Sequence lengths are padded to a multiple of this inside the forward.
 
 
 def _shifted(mask):
@@ -48,14 +54,15 @@ class Transformer(tf.Module):
 
     ``named_parameters`` yields the ``parameter_shapes`` names, each float32
     variable with a leading members axis. With ``half`` and a visible GPU the
-    matrix products and attention run in float16 while the residual stream,
-    norms and softmax stay float32; logits are always float32.
+    matrix products, attention and GELU run in bfloat16 while the residual
+    stream, norms and softmax stay float32; logits are always float32. Float16
+    was as fast but diverged to NaN in training.
     """
 
     def __init__(self, config, members=1, seed=0, half=True):
         super().__init__()
         self.config, self.members, self.half = config, members, half
-        self.compute = tf.float16 if half and tf.config.list_physical_devices("GPU") else tf.float32
+        self.compute = tf.bfloat16 if half and tf.config.list_physical_devices("GPU") else tf.float32
         self._parameters = {name: tf.Variable(value, name=name)
                             for name, value in init_parameters(config, seed, members).items()}
         features = config.features
@@ -101,11 +108,14 @@ class Transformer(tf.Module):
         k, b, t = tokens.shape
         if t > c.max_positions:
             raise ValueError("sequence exceeds max_positions")
+        # XLA's GPU attention ran about a third slower at length 111 than at 112. Positions only see
+        # earlier ones, so trailing padding leaves the real logits unchanged.
+        tokens = tf.pad(tokens, ((0, 0), (0, 0), (0, -t % ALIGN)))
         x = tf.gather(p["embedding"], tokens, batch_dims=1)
         if c.features is not None:
             ordinal, index = self.segment_features(tokens)
             x = x + tf.gather(p["ordinal"], ordinal, batch_dims=1) + tf.gather(p["index"], index, batch_dims=1)
-        return self._layers(tf.reshape(x, (k, b * t, c.width)), k, b, t)
+        return self._layers(tf.reshape(x, (k, -1, c.width)), k, b, tokens.shape[-1])[:, :, :t]
 
     def _layers(self, x, k, b, t):
         c, p = self.config, self._parameters
@@ -232,16 +242,17 @@ class Trainer:
     optionally ``weight[N]`` (sampling weights, uniform by default) and the
     ``sequence_loss`` soft targets ``soft_positions``, ``soft_tokens`` and
     ``soft_shares``. Each step draws ``batch`` rows per member. ``loss`` holds
-    the last per-member losses. With ``compile`` the step is XLA-compiled.
-    AdamW matches ``torch.optim.AdamW`` (decoupled decay, bias-corrected
-    moments, ``eps = 1e-8``).
+    the last per-member losses. With ``compile`` the step is XLA-compiled; the
+    constructor compiles it with one update that it then discards. Rows stay
+    on the device in their own integer types. AdamW matches
+    ``torch.optim.AdamW`` (decoupled decay, bias-corrected moments,
+    ``eps = 1e-8``).
     """
 
     def __init__(self, model, rows, batch, lr, ema=0.999, allowed=None, compile=True, betas=(0.9, 0.98),
                  weight_decay=0.01, seed=0):
         self.model, self.batch, self.ema, self.betas, self.weight_decay = model, batch, ema, betas, weight_decay
-        self.tokens = tf.convert_to_tensor(np.asarray(rows["tokens"]), tf.int64)
-        self.groups = tf.convert_to_tensor(np.asarray(rows["groups"]), tf.int64)
+        self.tokens, self.groups = (tf.convert_to_tensor(np.asarray(rows[name])) for name in ("tokens", "groups"))
         self.soft = tuple(tf.convert_to_tensor(np.asarray(rows[name])) for name in SOFT) if SOFT[0] in rows else ()
         weight = rows.get("weight")
         cdf = np.cumsum(np.ones(len(rows["tokens"])) if weight is None else np.asarray(weight, dtype=np.float64))
@@ -257,6 +268,12 @@ class Trainer:
         self.generator = tf.random.Generator.from_seed(seed)
         self._sampled = tf.function(lambda: self._update(self._draw()), jit_compile=compile)
         self._step_rows = tf.function(self._update, jit_compile=compile)  # Fixed rows [members, batch], for tests.
+        state = [*self.parameters, *self.moments[0], *self.moments[1], *self.average, self.steps, self.loss,
+                 self.generator.state]
+        saved = [v.numpy() for v in state]
+        self.step(lr)
+        for v, value in zip(state, saved):
+            v.assign(value)
 
     def _draw(self):
         draw = self.generator.uniform((self.model.members, self.batch), dtype=tf.float64)
@@ -287,10 +304,16 @@ class Trainer:
             a.assign_add((1 - self.ema) * (p - a))
         self.loss.assign(loss)
 
-    def step(self, lr):
-        """One training step at learning rate ``lr``."""
+    def step(self, lr, steps=1):
+        """``steps`` training steps at learning rate ``lr``.
+
+        Sending a new ``lr`` to the GPU waits for the queued steps to finish,
+        so a host loop that changes it every step leaves the GPU idle while
+        the next call launches; ``steps`` above one amortizes that wait.
+        """
         self.lr.assign(lr)
-        self._sampled()
+        for _ in range(steps):
+            self._sampled()
 
     def averaged(self):
         """``Transformer`` holding the parameter EMA of every member."""

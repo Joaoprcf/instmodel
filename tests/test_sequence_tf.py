@@ -16,6 +16,7 @@ def backend():
     """
     global tf, st
     tf = pytest.importorskip("tensorflow")
+    tf.config.experimental.enable_tensor_float_32_execution(False)  # The checks below are float32-exact.
     from instmodel.sequence import tf as st
 
 
@@ -193,6 +194,8 @@ def test_optimizer_step_matches_numpy_adamw():
         model.load_parameters(randomized(config, seed=member), member=member)
     lr, betas, decay, ema = 3e-3, (0.8, 0.95), 0.1, 0.7
     trainer = st.Trainer(model, data, batch=4, lr=lr, ema=ema, betas=betas, weight_decay=decay)
+    for key, value in randomized(config, seed=1).items():  # The compiling update is discarded.
+        np.testing.assert_array_equal(model.member_parameters(1)[key], value)
     names = [name for name, _ in model.named_parameters()]
     params = {name: v.numpy().astype(np.float64) for name, v in model.named_parameters()}
     average = {name: value.copy() for name, value in params.items()}
@@ -239,6 +242,24 @@ def test_lower_bound_matches_searchsorted():
         compiled = tf.function(st.lower_bound, jit_compile=True)
         np.testing.assert_array_equal(compiled(tf.constant(ascending), tf.constant(values)).numpy(),
                                       np.searchsorted(ascending, values))
+
+
+def test_several_steps_per_call_equal_single_steps():
+    config = config_of("grouped")
+    rng = np.random.default_rng(0)
+    data = dict(tokens=rng.integers(0, 14, (32, 13)), groups=rng.integers(-1, 2, (32, 12)))
+    finals = []
+    for calls in ((1, 1, 1), (3,)):
+        trainer = st.Trainer(st.Transformer(config, members=2, half=False), data, batch=4, lr=1e-2)
+        for steps in calls:
+            trainer.step(1e-2, steps)
+        assert float(trainer.steps.numpy()) == 3
+        finals.append(trainer.model.member_parameters(1))
+    keys = slice(config.width, config.width + config.kv_heads * config.head_dim)
+    for key, value in finals[0].items():
+        if key.endswith("qkv_bias"):  # Adam steps the key bias on rounding noise: its true gradient is zero.
+            value, finals[1][key] = np.delete(value, keys), np.delete(finals[1][key], keys)
+        np.testing.assert_allclose(finals[1][key], value, atol=1e-6, err_msg=key)
 
 
 def test_schedule_endpoints():

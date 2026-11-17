@@ -260,10 +260,11 @@ class Trainer:
             torch._foreach_lerp_(self.average, [p.detach() for p in self.parameters], 1 - self.ema)
             self.loss.copy_(loss.detach())
 
-    def step(self, lr):
-        """One training step at learning rate ``lr``."""
+    def step(self, lr, steps=1):
+        """``steps`` training steps at learning rate ``lr``."""
         self.lr.fill_(lr)
-        self.graph.replay() if self.graph is not None else self._step()
+        for _ in range(steps):
+            self.graph.replay() if self.graph is not None else self._step()
 
     @torch.no_grad()
     def averaged(self):
